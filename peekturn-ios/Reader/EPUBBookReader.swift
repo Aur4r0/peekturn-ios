@@ -50,11 +50,22 @@ struct EPUBBookReader {
                 throw EPUBReaderError.invalidEPUB
             }
 
-            let packageData = try archive.data(for: packagePath)
+            let normalizedPackagePath: String
+            do {
+                normalizedPackagePath = try EPUBArchivePath.normalized(packagePath)
+            } catch {
+                throw EPUBReaderError.invalidEPUB
+            }
+
+            let packageData = try archive.data(for: normalizedPackagePath)
             let packageParser = ReaderPackageParser()
-            guard packageParser.parse(packageData, relativeTo: packagePath),
-                  let firstSpineItem = packageParser.spineItemIDs.first,
-                  let firstSpinePath = packageParser.manifest[firstSpineItem]?.archivePath else {
+            guard packageParser.parse(packageData, relativeTo: normalizedPackagePath),
+                  let firstSpineItem = packageParser.firstReadableSpineItem() else {
+                throw EPUBReaderError.noReadableContent
+            }
+
+            let firstSpinePath = firstSpineItem.archivePath
+            guard (try? archive.data(for: firstSpinePath)) != nil else {
                 throw EPUBReaderError.noReadableContent
             }
 
@@ -71,7 +82,12 @@ struct EPUBBookReader {
                         for: item.archivePath,
                         in: temporaryDirectory
                     )
-                    let data = try archive.data(for: item.archivePath)
+                    guard let data = try? archive.data(for: item.archivePath) else {
+                        if item.archivePath == firstSpinePath {
+                            throw EPUBReaderError.noReadableContent
+                        }
+                        continue
+                    }
                     try fileManager.createDirectory(
                         at: destinationURL.deletingLastPathComponent(),
                         withIntermediateDirectories: true
@@ -87,8 +103,15 @@ struct EPUBBookReader {
                     throw EPUBReaderError.noReadableContent
                 }
 
+                let securedDocumentURL = mainDocumentURL
+                    .deletingLastPathComponent()
+                    .appendingPathComponent(".peekturn-main-\(UUID().uuidString).xhtml")
+                let mainDocumentData = try Data(contentsOf: mainDocumentURL)
+                try ReaderHTMLSecurity.securedData(from: mainDocumentData)
+                    .write(to: securedDocumentURL, options: .atomic)
+
                 return EPUBReadingDocument(
-                    mainDocumentURL: mainDocumentURL,
+                    mainDocumentURL: securedDocumentURL,
                     readAccessDirectory: temporaryDirectory,
                     temporaryDirectory: temporaryDirectory
                 )
@@ -135,6 +158,15 @@ struct EPUBBookReader {
 
 private struct ReaderManifestItem {
     let archivePath: String
+    let mediaType: String
+
+    var isReadableDocument: Bool {
+        let normalizedMediaType = mediaType
+            .split(separator: ";", maxSplits: 1, omittingEmptySubsequences: true)
+            .first
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+        return normalizedMediaType == "application/xhtml+xml" || normalizedMediaType == "text/html"
+    }
 }
 
 private final class ReaderContainerParser: NSObject, XMLParserDelegate {
@@ -162,18 +194,33 @@ private final class ReaderContainerParser: NSObject, XMLParserDelegate {
 
 private final class ReaderPackageParser: NSObject, XMLParserDelegate {
     private(set) var manifest = [String: ReaderManifestItem]()
-    private(set) var spineItemIDs = [String]()
-    private var packageDirectory = [String]()
+    private var spineItemReferences = [(id: String?, isLinear: Bool)]()
+    private var packageDirectory: String?
 
     func parse(_ data: Data, relativeTo packagePath: String) -> Bool {
-        packageDirectory = packagePath
-            .split(separator: "/", omittingEmptySubsequences: true)
-            .dropLast()
-            .map(String.init)
+        do {
+            packageDirectory = try EPUBArchivePath.directory(of: packagePath)
+        } catch {
+            return false
+        }
 
         let parser = XMLParser(data: data)
         parser.delegate = self
         return parser.parse()
+    }
+
+    func firstReadableSpineItem() -> ReaderManifestItem? {
+        for reference in spineItemReferences {
+            guard reference.isLinear,
+                  let id = reference.id,
+                  !id.isEmpty,
+                  let item = manifest[id],
+                  item.isReadableDocument else {
+                continue
+            }
+            return item
+        }
+        return nil
     }
 
     func parser(
@@ -188,42 +235,17 @@ private final class ReaderPackageParser: NSObject, XMLParserDelegate {
         case "item":
             guard let id = attributeDict["id"],
                   let href = attributeDict["href"],
-                  let archivePath = Self.archivePath(for: href, relativeTo: packageDirectory) else {
+                  let mediaType = attributeDict["media-type"],
+                  let archivePath = try? EPUBArchivePath.normalized(href, relativeTo: packageDirectory) else {
                 return
             }
-            manifest[id] = ReaderManifestItem(archivePath: archivePath)
+            manifest[id] = ReaderManifestItem(archivePath: archivePath, mediaType: mediaType)
         case "itemref":
-            if let idref = attributeDict["idref"] {
-                spineItemIDs.append(idref)
-            }
+            let idref = attributeDict["idref"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let isLinear = attributeDict["linear"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() != "no"
+            spineItemReferences.append((id: idref, isLinear: isLinear))
         default:
             break
         }
-    }
-
-    private static func archivePath(for href: String, relativeTo packageDirectory: [String]) -> String? {
-        let pathPart = href.split(whereSeparator: { $0 == "#" || $0 == "?" }).first.map(String.init)
-        guard let pathPart,
-              !pathPart.isEmpty,
-              !pathPart.hasPrefix("/"),
-              !pathPart.contains("://") else {
-            return nil
-        }
-
-        let decodedPath = pathPart.removingPercentEncoding ?? pathPart
-        var components = packageDirectory
-        for component in decodedPath.split(separator: "/", omittingEmptySubsequences: true) {
-            switch component {
-            case ".":
-                continue
-            case "..":
-                guard !components.isEmpty else { return nil }
-                components.removeLast()
-            default:
-                components.append(String(component))
-            }
-        }
-        guard !components.isEmpty else { return nil }
-        return components.joined(separator: "/")
     }
 }

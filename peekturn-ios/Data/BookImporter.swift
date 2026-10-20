@@ -195,7 +195,8 @@ struct EPUBArchive {
     }
 
     func data(for name: String) throws -> Data {
-        guard let entry = entries[name] else {
+        guard let normalizedName = try? EPUBArchivePath.normalized(name),
+              let entry = entries[normalizedName] else {
             throw EPUBArchiveError.invalidEPUB
         }
         guard entry.localHeaderOffset + 30 <= data.count,
@@ -262,7 +263,8 @@ struct EPUBArchive {
             guard declaredUncompressedSize <= UInt64(maxUncompressedZIPEntrySize),
                   compressedSize <= maxUncompressedZIPEntrySize,
                   nameEnd <= data.count,
-                  let name = String(data: data.subdata(in: nameStart..<nameEnd), encoding: .utf8) else {
+                  let rawName = String(data: data.subdata(in: nameStart..<nameEnd), encoding: .utf8),
+                  let name = try? EPUBArchivePath.normalizedArchiveEntry(rawName) else {
                 throw EPUBArchiveError.invalidEPUB
             }
 

@@ -81,25 +81,99 @@ private struct EPUBWebView: UIViewRepresentable {
     }
 
     func makeUIView(context: Context) -> WKWebView {
-        let webView = WKWebView(frame: .zero)
+        let configuration = WKWebViewConfiguration()
+        configuration.userContentController = WKUserContentController()
+        let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.isOpaque = false
         webView.backgroundColor = .clear
         webView.scrollView.backgroundColor = .clear
-        loadDocument(in: webView, coordinator: context.coordinator)
+        webView.navigationDelegate = context.coordinator
+        context.coordinator.prepareToLoad(
+            webView: webView,
+            documentURL: documentURL,
+            readAccessDirectory: readAccessDirectory
+        )
         return webView
     }
 
     func updateUIView(_ webView: WKWebView, context: Context) {
-        loadDocument(in: webView, coordinator: context.coordinator)
+        context.coordinator.prepareToLoad(
+            webView: webView,
+            documentURL: documentURL,
+            readAccessDirectory: readAccessDirectory
+        )
     }
 
-    private func loadDocument(in webView: WKWebView, coordinator: Coordinator) {
-        guard coordinator.loadedURL != documentURL else { return }
-        coordinator.loadedURL = documentURL
-        webView.loadFileURL(documentURL, allowingReadAccessTo: readAccessDirectory)
-    }
+    final class Coordinator: NSObject, WKNavigationDelegate {
+        private var hasStartedLoading = false
+        private var readAccessDirectory: URL?
 
-    final class Coordinator {
-        var loadedURL: URL?
+        func prepareToLoad(webView: WKWebView, documentURL: URL, readAccessDirectory: URL) {
+            guard !hasStartedLoading else { return }
+            hasStartedLoading = true
+            self.readAccessDirectory = readAccessDirectory
+
+            let encodedRules = """
+            [{"trigger":{"url-filter":"^https?://","resource-type":["document","image","style-sheet","script","font","media","svg-document","raw","popup"]},"action":{"type":"block"}}]
+            """
+            WKContentRuleListStore.default().compileContentRuleList(
+                forIdentifier: "PeekturnReaderBlockExternalNetwork",
+                encodedContentRuleList: encodedRules
+            ) { [weak self, weak webView] ruleList, _ in
+                DispatchQueue.main.async {
+                    guard let self, let webView else { return }
+                    if let ruleList {
+                        webView.configuration.userContentController.add(ruleList)
+                    }
+                    webView.loadFileURL(
+                        documentURL,
+                        allowingReadAccessTo: readAccessDirectory
+                    )
+                }
+            }
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            decidePolicyFor navigationAction: WKNavigationAction,
+            decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+        ) {
+            guard let url = navigationAction.request.url,
+                  let readAccessDirectory else {
+                decisionHandler(.cancel)
+                return
+            }
+
+            decisionHandler(
+                ReaderNavigationPolicy.allowsNavigation(url, inside: readAccessDirectory)
+                    ? .allow
+                    : .cancel
+            )
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            decidePolicyFor navigationResponse: WKNavigationResponse,
+            decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
+        ) {
+            guard let url = navigationResponse.response.url,
+                  let readAccessDirectory else {
+                decisionHandler(.cancel)
+                return
+            }
+
+            decisionHandler(
+                ReaderNavigationPolicy.allowsResourceRequest(url, inside: readAccessDirectory)
+                    ? .allow
+                    : .cancel
+            )
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            didReceiveServerRedirectForProvisionalNavigation navigation: WKNavigation!
+        ) {
+            webView.stopLoading()
+        }
     }
 }

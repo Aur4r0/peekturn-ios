@@ -3,7 +3,7 @@ import SwiftUI
 struct ContentView: View {
     private let repository: BookRepository
     @StateObject private var viewModel: LibraryViewModel
-    @State private var selectedBook: Book?
+    @State private var navigationState = ReaderNavigationState()
 
     init() {
         let repository = BookRepository()
@@ -20,13 +20,22 @@ struct ContentView: View {
                 viewModel.importBook(from: url)
             },
             onOpenBook: { book in
-                selectedBook = book
+                navigationState.open(book: book)
             },
             onDismissError: {
                 viewModel.clearError()
             }
         )
-        .sheet(item: $selectedBook) { book in
+        .sheet(
+            item: Binding(
+                get: { navigationState.selectedBook },
+                set: { selectedBook in
+                    if selectedBook == nil {
+                        navigationState.returnToLibrary()
+                    }
+                }
+            )
+        ) { book in
             NavigationStack {
                 ReaderView(book: book, repository: repository)
             }
