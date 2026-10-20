@@ -69,6 +69,39 @@ xcodebuild -project peekturn-ios.xcodeproj \
 7. 在模拟器或真机验证。
 8. 更新相关文档。
 
+## Dual-Codex Git Worktree Workflow
+
+本项目使用两个独立的 Codex 会话协作：Builder 编写代码，Reviewer 审查固定提交并负责合并。
+
+### Worktree ownership
+
+- 主工作树 `/Users/aur4r0/VibeCodeProject/peekturn-ios` 只用于 `main` 和最终合并。
+- Builder 工作树 `/Users/aur4r0/VibeCodeProject/peekturn-ios-builder` 只用于 `feat/ios-reader-next`。
+- Reviewer 必须从完整提交 SHA 创建 detached worktree，不直接审查 Builder 的未提交工作树。
+- Builder 不得修改 `main`，Reviewer 未批准前不得合并或推送。
+
+### Handoff rules
+
+1. Builder 完成一个可交付范围后，先运行受影响测试和 `git diff --check`。
+2. Builder 提交后输出完整 SHA、变更范围、验证命令和结果。
+3. 输出 SHA 后，Builder 不得 amend、rebase 或继续修改该提交。
+4. Reviewer 只审查该 SHA。需要修复时，Builder 创建新提交，Reviewer 重新审查新 SHA。
+5. Reviewer 批准后，只能将已审查的 SHA 合并到 `main`。禁止直接合并可能继续移动的 feature 分支。
+
+### Merge gate
+
+合并前必须确认：
+
+- 主工作树无未提交修改。
+- `main` 仍然是 Builder 开始时记录的基线。
+- Reviewer worktree 的 `HEAD` 等于交接时的完整 SHA。
+- 构建、单元测试和受影响的 UI 测试均已在该 SHA 上完成。
+- 合并使用 `git merge --ff-only <reviewed-sha>`；无法快进时必须重新审查。
+
+### Verification command
+
+Reviewer 可以使用 `scripts/verify.sh` 执行固定的构建和完整测试。模拟器可通过 `DESTINATION` 环境变量覆盖，DerivedData 可通过 `DERIVED_DATA_PATH` 环境变量覆盖。
+
 ## UI and visual design
 
 界面应当简洁、好看并具有克制的高级感，优先服务阅读体验，不用装饰堆叠制造复杂感。

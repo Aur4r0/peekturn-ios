@@ -34,8 +34,10 @@ struct LibraryEmptyState: View {
     }
 }
 
-#Preview {
-    LibraryEmptyState()
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(PeekturnTheme.pageBackground)
+struct LibraryEmptyState_Previews: PreviewProvider {
+    static var previews: some View {
+        LibraryEmptyState()
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(PeekturnTheme.pageBackground)
+    }
 }
