@@ -2,10 +2,21 @@ import Foundation
 
 enum ReaderNavigationPolicy {
     static func allowsLocalFile(_ url: URL, inside directory: URL) -> Bool {
-        guard url.isFileURL else { return false }
+        guard url.isFileURL,
+              url.host == nil || url.host?.isEmpty == true else {
+            return false
+        }
 
-        let rootPath = directory.standardizedFileURL.resolvingSymlinksInPath().path
-        let candidatePath = url.standardizedFileURL.resolvingSymlinksInPath().path
+        let rootPath = directory
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+            .path
+        let candidatePath = url
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+            .path
         return candidatePath == rootPath || candidatePath.hasPrefix(rootPath + "/")
     }
 

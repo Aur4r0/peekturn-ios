@@ -109,6 +109,32 @@ struct peekturn_iosTests {
         )
     }
 
+    @Test func archiveRejectsCentralDirectoryThatExtendsPastEOCD() throws {
+        let archiveData = makeEPUBData(title: "Book", author: "Author")
+        let eocdOffset = archiveData.count - 22
+        let centralDirectorySize = readUInt32(archiveData, at: eocdOffset + 12)
+        let malformedData = replacingEOCDCentralDirectory(
+            in: archiveData,
+            entryCount: 3,
+            centralDirectorySize: centralDirectorySize + 1,
+            centralDirectoryOffset: readUInt32(archiveData, at: eocdOffset + 16)
+        )
+
+        assertArchiveRejects(malformedData)
+    }
+
+    @Test func archiveRejectsCentralDirectoryLocatedAfterEOCD() throws {
+        let archiveData = makeEPUBData(title: "Book", author: "Author")
+        let malformedData = replacingEOCDCentralDirectory(
+            in: archiveData,
+            entryCount: 0,
+            centralDirectorySize: 0,
+            centralDirectoryOffset: UInt32(archiveData.count)
+        )
+
+        assertArchiveRejects(malformedData)
+    }
+
     @Test func readerPreparesFirstSpineDocumentFromEPUB() throws {
         let fileManager = FileManager.default
         let rootDirectory = try makeTemporaryDirectory()
@@ -179,6 +205,32 @@ struct peekturn_iosTests {
         } catch {
             #expect(error as? EPUBReaderError == .invalidEPUB)
         }
+    }
+
+    @Test func readerRejectsMimetypeThatIsNotTheFirstZIPEntry() throws {
+        let archiveData = makeStoredZIP(entries: [
+            ("META-INF/container.xml", Data()),
+            ("mimetype", Data("application/epub+zip".utf8))
+        ])
+        assertArchiveRejects(archiveData)
+    }
+
+    @Test func readerRejectsCompressedMimetype() throws {
+        assertArchiveRejects(
+            replacingFirstMimetypeCompressionMethod(
+                in: makeEPUBData(title: "Book", author: "Author"),
+                with: 8
+            )
+        )
+    }
+
+    @Test func readerRejectsMimetypeWithAnExtraField() throws {
+        assertArchiveRejects(
+            replacingFirstMimetypeExtraLength(
+                in: makeEPUBData(title: "Book", author: "Author"),
+                with: 1
+            )
+        )
     }
 
     @Test func readerClassifiesMalformedOPFAsInvalidEPUB() throws {
@@ -320,6 +372,57 @@ struct peekturn_iosTests {
         #expect(chapter.contains("Content-Security-Policy"))
     }
 
+    @Test func readerSupportsUTF16ChapterWithBOMAndPreservesCSP() throws {
+        let packageXML = """
+        <package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+            <manifest><item id="chapter" href="Text/chapter.xhtml" media-type="application/xhtml+xml"/></manifest>
+            <spine><itemref idref="chapter"/></spine>
+        </package>
+        """
+        let utf16Chapter = makeUTF16LEData("""
+        <?xml version="1.0" encoding="UTF-16"?>
+        <html><head><script>window.bad = true</script></head><body><h1>UTF-16 chapter</h1></body></html>
+        """)
+        let epubURL = try writeReaderEPUB(
+            packageXML: packageXML,
+            binaryResources: [("OEBPS/Text/chapter.xhtml", utf16Chapter)]
+        )
+        defer { try? FileManager.default.removeItem(at: epubURL.deletingLastPathComponent()) }
+
+        let document = try EPUBBookReader().prepareReadingDocument(from: epubURL)
+        defer { document.removeTemporaryFiles() }
+        let securedChapter = try String(contentsOf: document.mainDocumentURL, encoding: .utf8)
+        #expect(securedChapter.contains("UTF-16 chapter"))
+        #expect(securedChapter.contains("encoding=\"UTF-8\""))
+        #expect(securedChapter.contains("Content-Security-Policy"))
+        #expect(securedChapter.range(of: "Content-Security-Policy")!.lowerBound < securedChapter.range(of: "<script")!.lowerBound)
+    }
+
+    @Test func readerRejectsChapterWithUnknownEncoding() throws {
+        let epubURL = try writeReaderEPUB(
+            packageXML: """
+            <package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+                <manifest><item id="chapter" href="Text/chapter.xhtml" media-type="application/xhtml+xml"/></manifest>
+                <spine><itemref idref="chapter"/></spine>
+            </package>
+            """,
+            binaryResources: [
+                (
+                    "OEBPS/Text/chapter.xhtml",
+                    Data("<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><html><body>Chapter</body></html>".utf8)
+                )
+            ]
+        )
+        defer { try? FileManager.default.removeItem(at: epubURL.deletingLastPathComponent()) }
+
+        do {
+            _ = try EPUBBookReader().prepareReadingDocument(from: epubURL)
+            #expect(Bool(false))
+        } catch {
+            #expect(error as? EPUBReaderError == .invalidEPUB)
+        }
+    }
+
     @Test func readerRejectsOPFPathTraversal() throws {
         let epubURL = try writeReaderEPUB(
             packageXML: """
@@ -402,6 +505,16 @@ struct peekturn_iosTests {
         #expect(!ReaderNavigationPolicy.allowsNavigation(externalURL, inside: rootDirectory))
         #expect(!ReaderNavigationPolicy.allowsRedirect(externalURL, inside: rootDirectory))
         #expect(!ReaderNavigationPolicy.allowsResourceRequest(externalURL, inside: rootDirectory))
+    }
+
+    @Test func readerNavigationPolicyRejectsFileURLsWithAHost() throws {
+        let rootDirectory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: rootDirectory) }
+        let localURL = rootDirectory.appendingPathComponent("chapter.xhtml")
+        let hostedFileURL = try #require(URL(string: "file://reader.example\(localURL.path)"))
+
+        #expect(hostedFileURL.isFileURL)
+        #expect(!ReaderNavigationPolicy.allowsLocalFile(hostedFileURL, inside: rootDirectory))
     }
 
     @Test func readerNavigationPolicyRejectsPathTraversalOutsideReaderDirectory() throws {
@@ -887,6 +1000,7 @@ private func writeReaderEPUB(
     packagePath: String = "OEBPS/content.opf",
     packageXML: String,
     resources: [(String, String)] = [],
+    binaryResources: [(String, Data)] = [],
     mimetype: String = "application/epub+zip"
 ) throws -> URL {
     let rootDirectory = try makeTemporaryDirectory()
@@ -895,6 +1009,7 @@ private func writeReaderEPUB(
         packagePath: packagePath,
         packageXML: packageXML,
         resources: resources,
+        binaryResources: binaryResources,
         mimetype: mimetype
     ).write(to: epubURL)
     return epubURL
@@ -904,6 +1019,7 @@ private func makeReaderEPUBData(
     packagePath: String = "OEBPS/content.opf",
     packageXML: String,
     resources: [(String, String)] = [],
+    binaryResources: [(String, Data)] = [],
     mimetype: String = "application/epub+zip"
 ) -> Data {
     let containerXML = """
@@ -922,6 +1038,7 @@ private func makeReaderEPUBData(
         (packageEntryPath, Data(packageXML.utf8))
     ]
     entries.append(contentsOf: resources.map { ($0.0, Data($0.1.utf8)) })
+    entries.append(contentsOf: binaryResources)
     return makeStoredZIP(entries: entries)
 }
 
@@ -973,6 +1090,100 @@ private func replacingFirstCentralDirectoryField(in data: Data, fieldOffset: Int
         break
     }
     return result
+}
+
+private func replacingEOCDCentralDirectory(
+    in data: Data,
+    entryCount: UInt16,
+    centralDirectorySize: UInt32,
+    centralDirectoryOffset: UInt32
+) -> Data {
+    var result = data
+    let eocdOffset = result.count - 22
+    replaceUInt16(entryCount, in: &result, at: eocdOffset + 8)
+    replaceUInt16(entryCount, in: &result, at: eocdOffset + 10)
+    replaceUInt32(centralDirectorySize, in: &result, at: eocdOffset + 12)
+    replaceUInt32(centralDirectoryOffset, in: &result, at: eocdOffset + 16)
+    return result
+}
+
+private func replacingFirstMimetypeCompressionMethod(in data: Data, with method: UInt16) -> Data {
+    var result = data
+    replaceUInt16(method, in: &result, at: 8)
+    for offset in 0..<(result.count - 46) {
+        guard result[offset] == 0x50,
+              result[offset + 1] == 0x4b,
+              result[offset + 2] == 0x01,
+              result[offset + 3] == 0x02 else {
+            continue
+        }
+        replaceUInt16(method, in: &result, at: offset + 10)
+        break
+    }
+    return result
+}
+
+private func replacingFirstMimetypeExtraLength(in data: Data, with length: UInt16) -> Data {
+    var result = data
+    replaceUInt16(length, in: &result, at: 28)
+    for offset in 0..<(result.count - 46) {
+        guard result[offset] == 0x50,
+              result[offset + 1] == 0x4b,
+              result[offset + 2] == 0x01,
+              result[offset + 3] == 0x02 else {
+            continue
+        }
+        replaceUInt16(length, in: &result, at: offset + 30)
+        break
+    }
+    return result
+}
+
+private func assertArchiveRejects(_ data: Data) {
+    let rootDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("PeekturnArchiveTests-\(UUID().uuidString)", isDirectory: true)
+    let archiveURL = rootDirectory.appendingPathComponent("invalid.epub")
+    do {
+        try FileManager.default.createDirectory(at: rootDirectory, withIntermediateDirectories: true)
+        try data.write(to: archiveURL)
+        do {
+            _ = try EPUBArchive(url: archiveURL, fileManager: .default)
+            #expect(Bool(false))
+        } catch {
+            #expect(Bool(true))
+        }
+    } catch {
+        #expect(Bool(false))
+    }
+    try? FileManager.default.removeItem(at: rootDirectory)
+}
+
+private func readUInt32(_ data: Data, at offset: Int) -> UInt32 {
+    UInt32(data[offset]) |
+        UInt32(data[offset + 1]) << 8 |
+        UInt32(data[offset + 2]) << 16 |
+        UInt32(data[offset + 3]) << 24
+}
+
+private func replaceUInt16(_ value: UInt16, in data: inout Data, at offset: Int) {
+    data[offset] = UInt8(value & 0xff)
+    data[offset + 1] = UInt8((value >> 8) & 0xff)
+}
+
+private func replaceUInt32(_ value: UInt32, in data: inout Data, at offset: Int) {
+    data[offset] = UInt8(value & 0xff)
+    data[offset + 1] = UInt8((value >> 8) & 0xff)
+    data[offset + 2] = UInt8((value >> 16) & 0xff)
+    data[offset + 3] = UInt8((value >> 24) & 0xff)
+}
+
+private func makeUTF16LEData(_ string: String) -> Data {
+    var data = Data([0xff, 0xfe])
+    for codeUnit in string.utf16 {
+        data.append(UInt8(codeUnit & 0xff))
+        data.append(UInt8((codeUnit >> 8) & 0xff))
+    }
+    return data
 }
 
 private func assertImporterRejects(_ data: Data) throws {

@@ -148,7 +148,7 @@ private struct EPUBMetadataReader {
     func read(from url: URL, fallbackTitle: String) throws -> EPUBMetadata {
         let archive = try EPUBArchive(url: url, fileManager: fileManager)
         let mimetype = try archive.data(for: "mimetype")
-        guard String(data: mimetype, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) == "application/epub+zip" else {
+        guard mimetype == Data("application/epub+zip".utf8) else {
             throw EPUBArchiveError.invalidEPUB
         }
 
@@ -243,13 +243,15 @@ struct EPUBArchive {
         guard centralDirectoryOffset >= 0,
               centralDirectorySize >= 0,
               !centralDirectoryOverflow,
+              centralDirectoryOffset <= endOfCentralDirectory,
+              centralDirectoryEnd <= endOfCentralDirectory,
               centralDirectoryEnd <= data.count else {
             throw EPUBArchiveError.invalidEPUB
         }
 
         var entries = [String: Entry]()
         var offset = centralDirectoryOffset
-        for _ in 0..<entryCount {
+        for entryIndex in 0..<entryCount {
             guard offset >= centralDirectoryOffset,
                   offset <= centralDirectoryEnd,
                   centralDirectoryEnd - offset >= 46,
@@ -283,6 +285,27 @@ struct EPUBArchive {
                   let rawName = String(data: data.subdata(in: nameStart..<nameEnd), encoding: .utf8),
                   let name = try? EPUBArchivePath.normalizedArchiveEntry(rawName) else {
                 throw EPUBArchiveError.invalidEPUB
+            }
+
+            if entryIndex == 0 {
+                guard name == "mimetype",
+                      compressionMethod == 0,
+                      extraLength == 0,
+                      localHeaderOffset == 0,
+                      localHeaderOffset + 30 <= data.count,
+                      data.uint32(at: localHeaderOffset) == 0x04034b50,
+                      data.uint16(at: localHeaderOffset + 8) == 0,
+                      data.uint16(at: localHeaderOffset + 26) == nameLength,
+                      data.uint16(at: localHeaderOffset + 28) == 0,
+                      localHeaderOffset + 30 + nameLength <= data.count,
+                      String(
+                          data: data.subdata(
+                              in: (localHeaderOffset + 30)..<(localHeaderOffset + 30 + nameLength)
+                          ),
+                          encoding: .utf8
+                      ) == "mimetype" else {
+                    throw EPUBArchiveError.invalidEPUB
+                }
             }
 
             entries[name] = Entry(

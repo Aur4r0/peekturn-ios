@@ -2,9 +2,9 @@ import Foundation
 import Darwin
 
 struct EPUBReadingDocument: Sendable {
-    let mainDocumentURL: URL
-    let readAccessDirectory: URL
-    let temporaryDirectory: URL
+    nonisolated let mainDocumentURL: URL
+    nonisolated let readAccessDirectory: URL
+    nonisolated let temporaryDirectory: URL
 
     nonisolated func removeTemporaryFiles() {
         try? FileManager().removeItem(at: temporaryDirectory)

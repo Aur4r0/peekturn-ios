@@ -27,7 +27,7 @@ struct ReaderSecurityPolicy: Equatable, Sendable {
 }
 
 enum ReaderHTMLSecurityError: Error, Equatable, Sendable {
-    case invalidUTF8
+    case invalidEncoding
 }
 
 enum ReaderHTMLSecurity {
@@ -41,9 +41,8 @@ enum ReaderHTMLSecurity {
         from data: Data,
         policy: ReaderSecurityPolicy
     ) throws -> Data {
-        guard var html = String(data: data, encoding: .utf8) else {
-            throw ReaderHTMLSecurityError.invalidUTF8
-        }
+        var html = try decodeHTML(data)
+        html = normalizeXMLDeclaration(in: html)
 
         let metaTag = "<meta http-equiv=\"Content-Security-Policy\" content=\"\(policy.contentSecurityPolicy)\" />"
         if let headStart = html.range(of: "<head[^>]*>", options: [.caseInsensitive, .regularExpression]) {
@@ -55,5 +54,71 @@ enum ReaderHTMLSecurity {
             html = "<!doctype html><html><head>\(metaTag)</head><body>\(html)</body></html>"
         }
         return Data(html.utf8)
+    }
+
+    private nonisolated static func decodeHTML(_ data: Data) throws -> String {
+        if data.starts(with: [0xFF, 0xFE]) {
+            guard let html = String(data: data, encoding: .utf16LittleEndian) else {
+                throw ReaderHTMLSecurityError.invalidEncoding
+            }
+            return html.hasPrefix("\u{FEFF}") ? String(html.dropFirst()) : html
+        }
+
+        if data.starts(with: [0xFE, 0xFF]) {
+            guard let html = String(data: data, encoding: .utf16BigEndian) else {
+                throw ReaderHTMLSecurityError.invalidEncoding
+            }
+            return html.hasPrefix("\u{FEFF}") ? String(html.dropFirst()) : html
+        }
+
+        guard let html = String(data: data, encoding: .utf8) else {
+            throw ReaderHTMLSecurityError.invalidEncoding
+        }
+        let htmlWithoutBOM = html.hasPrefix("\u{FEFF}") ? String(html.dropFirst()) : html
+        guard hasSupportedXMLDeclarationEncoding(in: htmlWithoutBOM) else {
+            throw ReaderHTMLSecurityError.invalidEncoding
+        }
+        return htmlWithoutBOM
+    }
+
+    private nonisolated static func hasSupportedXMLDeclarationEncoding(in html: String) -> Bool {
+        guard let declarationRange = html.range(
+            of: "^\\s*<\\?xml\\b.*?\\?>",
+            options: [.caseInsensitive, .regularExpression]
+        ) else {
+            return true
+        }
+
+        let declaration = String(html[declarationRange])
+        guard let encodingRange = declaration.range(
+            of: "encoding\\s*=\\s*[\"']([^\"']+)[\"']",
+            options: [.caseInsensitive, .regularExpression]
+        ) else {
+            return true
+        }
+        let encoding = declaration[encodingRange]
+            .split(separator: "=", maxSplits: 1)
+            .last?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+            .lowercased()
+        return encoding == "utf-8" || encoding == "utf8"
+    }
+
+    private nonisolated static func normalizeXMLDeclaration(in html: String) -> String {
+        guard let declarationRange = html.range(
+            of: "^\\s*<\\?xml\\b.*?\\?>",
+            options: [.caseInsensitive, .regularExpression]
+        ) else {
+            return html
+        }
+
+        let declaration = String(html[declarationRange])
+        let normalizedDeclaration = declaration.replacingOccurrences(
+            of: "(encoding\\s*=\\s*[\"'])[^\"']+([\"'])",
+            with: "$1UTF-8$2",
+            options: [.caseInsensitive, .regularExpression]
+        )
+        return html.replacingCharacters(in: declarationRange, with: normalizedDeclaration)
     }
 }
