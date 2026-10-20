@@ -115,6 +115,61 @@ struct peekturn_iosTests {
         #expect(!fileManager.fileExists(atPath: storedURL.path))
     }
 
+    @Test func repositoryDeletesPersistedFileWhenCallerHasStaleFileName() throws {
+        let fileManager = FileManager.default
+        let rootDirectory = try makeTemporaryDirectory()
+        defer { try? fileManager.removeItem(at: rootDirectory) }
+
+        let repository = BookRepository(rootDirectory: rootDirectory)
+        let persistedBook = Book(title: "Book", author: "Author", epubFileName: "actual.epub")
+        let storedURL = try #require(try repository.fileURL(for: persistedBook))
+        try fileManager.createDirectory(at: repository.booksDirectory, withIntermediateDirectories: true)
+        try Data("epub".utf8).write(to: storedURL)
+        try repository.save(persistedBook)
+
+        let staleCallerBook = Book(
+            id: persistedBook.id,
+            title: persistedBook.title,
+            author: persistedBook.author,
+            epubFileName: "stale.epub"
+        )
+
+        try repository.delete(staleCallerBook)
+
+        #expect(try repository.fetchAll().isEmpty)
+        #expect(!fileManager.fileExists(atPath: storedURL.path))
+        #expect(!fileManager.fileExists(
+            atPath: repository.booksDirectory.appendingPathComponent("stale.epub").path
+        ))
+    }
+
+    @Test func repositoryDoesNotDeleteFileForUnknownBookID() throws {
+        let fileManager = FileManager.default
+        let rootDirectory = try makeTemporaryDirectory()
+        defer { try? fileManager.removeItem(at: rootDirectory) }
+
+        let repository = BookRepository(rootDirectory: rootDirectory)
+        let persistedBook = Book(title: "Book", author: "Author", epubFileName: "actual.epub")
+        let storedURL = try #require(try repository.fileURL(for: persistedBook))
+        let originalData = Data("epub".utf8)
+        try fileManager.createDirectory(at: repository.booksDirectory, withIntermediateDirectories: true)
+        try originalData.write(to: storedURL)
+        try repository.save(persistedBook)
+
+        let unknownBook = Book(
+            id: UUID(),
+            title: "Unknown",
+            author: "Author",
+            epubFileName: persistedBook.epubFileName
+        )
+
+        try repository.delete(unknownBook)
+
+        #expect(try repository.fetchAll() == [persistedBook])
+        #expect(fileManager.fileExists(atPath: storedURL.path))
+        #expect(try Data(contentsOf: storedURL) == originalData)
+    }
+
     @Test func repositoryReportsCorruptedLibraryData() throws {
         let fileManager = FileManager.default
         let rootDirectory = try makeTemporaryDirectory()

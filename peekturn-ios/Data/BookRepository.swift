@@ -101,12 +101,18 @@ final class BookRepository {
 
     func delete(_ book: Book) throws {
         try prepareDirectories()
-        try validateFileNameIfPresent(book.epubFileName)
 
-        var books = try fetchAll()
-        books.removeAll { $0.id == book.id }
+        let books = try fetchAll()
+        guard let persistedBook = books.first(where: { $0.id == book.id }) else {
+            return
+        }
 
-        let data = try encoder.encode(books)
+        try validateFileNameIfPresent(persistedBook.epubFileName)
+
+        var remainingBooks = books
+        remainingBooks.removeAll { $0.id == persistedBook.id }
+
+        let data = try encoder.encode(remainingBooks)
         let transactionID = UUID().uuidString
         let temporaryLibraryURL = rootDirectory.appendingPathComponent(
             ".library-\(transactionID).tmp",
@@ -116,9 +122,9 @@ final class BookRepository {
             ".library-\(transactionID).backup",
             isDirectory: false
         )
-        let bookURL = book.epubFileName.isEmpty
+        let bookURL = persistedBook.epubFileName.isEmpty
             ? nil
-            : booksDirectory.appendingPathComponent(book.epubFileName, isDirectory: false)
+            : booksDirectory.appendingPathComponent(persistedBook.epubFileName, isDirectory: false)
         let bookBackupURL = booksDirectory.appendingPathComponent(
             ".delete-\(transactionID).backup",
             isDirectory: false
