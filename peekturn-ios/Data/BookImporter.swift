@@ -146,7 +146,7 @@ private struct EPUBMetadataReader {
     let fileManager: FileManager
 
     func read(from url: URL, fallbackTitle: String) throws -> EPUBMetadata {
-        let archive = try ZIPArchive(url: url, fileManager: fileManager)
+        let archive = try EPUBArchive(url: url, fileManager: fileManager)
         let mimetype = try archive.data(for: "mimetype")
         guard String(data: mimetype, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) == "application/epub+zip" else {
             throw EPUBArchiveError.invalidEPUB
@@ -175,7 +175,7 @@ private enum EPUBArchiveError: Error {
     case invalidMetadata
 }
 
-private struct ZIPArchive {
+struct EPUBArchive {
     private struct Entry {
         let compressionMethod: UInt16
         let compressedSize: Int
@@ -191,7 +191,7 @@ private struct ZIPArchive {
             throw EPUBArchiveError.invalidEPUB
         }
         self.data = data
-        self.entries = try ZIPArchive.makeEntries(from: data)
+        self.entries = try EPUBArchive.makeEntries(from: data)
     }
 
     func data(for name: String) throws -> Data {

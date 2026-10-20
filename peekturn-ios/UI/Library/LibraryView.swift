@@ -5,6 +5,7 @@ struct LibraryView: View {
     let books: [Book]
     let errorMessage: String?
     let onImportURL: (URL) -> Void
+    let onOpenBook: (Book) -> Void
     let onDismissError: () -> Void
 
     @State private var isFileImporterPresented = false
@@ -13,11 +14,13 @@ struct LibraryView: View {
         books: [Book] = [],
         errorMessage: String? = nil,
         onImportURL: @escaping (URL) -> Void = { _ in },
+        onOpenBook: @escaping (Book) -> Void = { _ in },
         onDismissError: @escaping () -> Void = {}
     ) {
         self.books = books
         self.errorMessage = errorMessage
         self.onImportURL = onImportURL
+        self.onOpenBook = onOpenBook
         self.onDismissError = onDismissError
     }
 
@@ -29,7 +32,13 @@ struct LibraryView: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     List(books) { book in
-                        BookRow(book: book)
+                        Button {
+                            onOpenBook(book)
+                        } label: {
+                            BookRow(book: book)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityIdentifier("book-row-\(book.id.uuidString)")
                     }
                     .listStyle(.insetGrouped)
                 }

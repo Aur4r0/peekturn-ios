@@ -91,6 +91,39 @@ struct peekturn_iosTests {
         #expect(remainingFiles.isEmpty)
     }
 
+    @Test func readerPreparesFirstSpineDocumentFromEPUB() throws {
+        let fileManager = FileManager.default
+        let rootDirectory = try makeTemporaryDirectory()
+        defer { try? fileManager.removeItem(at: rootDirectory) }
+
+        let epubURL = rootDirectory.appendingPathComponent("reader.epub")
+        try makeReadableEPUBData().write(to: epubURL)
+
+        let document = try EPUBBookReader().prepareReadingDocument(from: epubURL)
+        defer { document.removeTemporaryFiles() }
+
+        #expect(fileManager.fileExists(atPath: document.mainDocumentURL.path))
+        #expect(fileManager.fileExists(atPath: document.readAccessDirectory.path))
+        let chapter = try String(contentsOf: document.mainDocumentURL, encoding: .utf8)
+        #expect(chapter.contains("The First Chapter"))
+        #expect(chapter.contains("Original EPUB content."))
+    }
+
+    @Test func readerReportsInvalidEPUBSource() throws {
+        let rootDirectory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: rootDirectory) }
+
+        let epubURL = rootDirectory.appendingPathComponent("broken.epub")
+        try Data("not an EPUB".utf8).write(to: epubURL)
+
+        do {
+            _ = try EPUBBookReader().prepareReadingDocument(from: epubURL)
+            #expect(Bool(false))
+        } catch {
+            #expect(error as? EPUBReaderError == .invalidEPUB)
+        }
+    }
+
     @Test func repositoryPersistsAndDeletesBookAndFile() throws {
         let fileManager = FileManager.default
         let rootDirectory = try makeTemporaryDirectory()
@@ -356,6 +389,52 @@ private func makeEPUBData(title: String, author: String) -> Data {
         ("mimetype", Data("application/epub+zip".utf8)),
         ("META-INF/container.xml", containerXML),
         ("OEBPS/content.opf", packageXML)
+    ])
+}
+
+private func makeReadableEPUBData() -> Data {
+    let containerXML = """
+    <?xml version="1.0" encoding="UTF-8"?>
+    <container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+        <rootfiles>
+            <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+        </rootfiles>
+    </container>
+    """.data(using: .utf8)!
+
+    let packageXML = """
+    <?xml version="1.0" encoding="UTF-8"?>
+    <package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+        <manifest>
+            <item id="chapter" href="Text/chapter.xhtml" media-type="application/xhtml+xml"/>
+            <item id="style" href="Styles/book.css" media-type="text/css"/>
+        </manifest>
+        <spine>
+            <itemref idref="chapter"/>
+        </spine>
+    </package>
+    """.data(using: .utf8)!
+
+    let chapter = """
+    <?xml version="1.0" encoding="UTF-8"?>
+    <html xmlns="http://www.w3.org/1999/xhtml">
+        <head>
+            <title>The First Chapter</title>
+            <link rel="stylesheet" type="text/css" href="../Styles/book.css"/>
+        </head>
+        <body>
+            <h1>The First Chapter</h1>
+            <p>Original EPUB content.</p>
+        </body>
+    </html>
+    """.data(using: .utf8)!
+
+    return makeStoredZIP(entries: [
+        ("mimetype", Data("application/epub+zip".utf8)),
+        ("META-INF/container.xml", containerXML),
+        ("OEBPS/content.opf", packageXML),
+        ("OEBPS/Text/chapter.xhtml", chapter),
+        ("OEBPS/Styles/book.css", Data("body { color: black; }".utf8))
     ])
 }
 
