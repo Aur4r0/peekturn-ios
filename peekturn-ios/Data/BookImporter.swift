@@ -308,6 +308,10 @@ struct EPUBArchive {
                 }
             }
 
+            guard entries[name] == nil else {
+                throw EPUBArchiveError.invalidEPUB
+            }
+
             entries[name] = Entry(
                 compressionMethod: compressionMethod,
                 compressedSize: compressedSize,

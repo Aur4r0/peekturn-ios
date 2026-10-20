@@ -1,5 +1,7 @@
 import Foundation
 import Testing
+import UIKit
+import WebKit
 @testable import peekturn_ios
 
 struct peekturn_iosTests {
@@ -233,6 +235,67 @@ struct peekturn_iosTests {
         )
     }
 
+    @Test func archiveRejectsIllegalFirstMimetypeFollowedByValidDuplicate() {
+        assertArchiveRejects(
+            makeStoredZIP(entries: [
+                ("mimetype", Data("application/zip".utf8)),
+                ("mimetype", Data("application/epub+zip".utf8))
+            ])
+        )
+    }
+
+    @Test func archiveRejectsValidFirstMimetypeFollowedByDuplicateReplacement() {
+        assertArchiveRejects(
+            makeStoredZIP(entries: [
+                ("mimetype", Data("application/epub+zip".utf8)),
+                ("mimetype", Data("application/zip".utf8))
+            ])
+        )
+    }
+
+    @Test func archiveRejectsDuplicateOrdinaryEntryNames() {
+        assertArchiveRejects(
+            makeStoredZIP(entries: [
+                ("mimetype", Data("application/epub+zip".utf8)),
+                ("chapter.xhtml", Data("first".utf8)),
+                ("chapter.xhtml", Data("second".utf8))
+            ])
+        )
+    }
+
+    @Test func readerRejectsEPUBWithDuplicateEntries() throws {
+        let containerXML = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <container xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+            <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+        </container>
+        """
+        let packageXML = """
+        <package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+            <manifest><item id="chapter" href="Text/chapter.xhtml" media-type="text/html"/></manifest>
+            <spine><itemref idref="chapter"/></spine>
+        </package>
+        """
+        let archiveData = makeStoredZIP(entries: [
+            ("mimetype", Data("application/epub+zip".utf8)),
+            ("META-INF/container.xml", Data(containerXML.utf8)),
+            ("OEBPS/content.opf", Data(packageXML.utf8)),
+            ("OEBPS/content.opf", Data(packageXML.utf8)),
+            ("OEBPS/Text/chapter.xhtml", Data("<h1>Chapter</h1>".utf8))
+        ])
+        let rootDirectory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: rootDirectory) }
+        let epubURL = rootDirectory.appendingPathComponent("duplicate.epub")
+        try archiveData.write(to: epubURL)
+
+        do {
+            _ = try EPUBBookReader().prepareReadingDocument(from: epubURL)
+            #expect(Bool(false))
+        } catch {
+            #expect(error as? EPUBReaderError == .invalidEPUB)
+        }
+    }
+
     @Test func readerClassifiesMalformedOPFAsInvalidEPUB() throws {
         let epubURL = try writeReaderEPUB(
             packageXML: "<package><manifest>",
@@ -396,6 +459,89 @@ struct peekturn_iosTests {
         #expect(securedChapter.contains("encoding=\"UTF-8\""))
         #expect(securedChapter.contains("Content-Security-Policy"))
         #expect(securedChapter.range(of: "Content-Security-Policy")!.lowerBound < securedChapter.range(of: "<script")!.lowerBound)
+    }
+
+    @Test func readerSupportsUTF8ChapterWithAndWithoutBOM() throws {
+        let packageXML = """
+        <package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+            <manifest><item id="chapter" href="Text/chapter.xhtml" media-type="application/xhtml+xml"/></manifest>
+            <spine><itemref idref="chapter"/></spine>
+        </package>
+        """
+        let chapter = Data("<?xml version=\"1.0\" encoding=\"UTF-8\"?><html><body><h1>UTF-8</h1></body></html>".utf8)
+        let variants = [chapter, Data([0xef, 0xbb, 0xbf]) + chapter]
+        let rootDirectory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: rootDirectory) }
+
+        for (index, chapterData) in variants.enumerated() {
+            let epubURL = rootDirectory.appendingPathComponent("utf8-\(index).epub")
+            try makeReaderEPUBData(
+                packageXML: packageXML,
+                binaryResources: [("OEBPS/Text/chapter.xhtml", chapterData)]
+            ).write(to: epubURL)
+            let document = try EPUBBookReader().prepareReadingDocument(from: epubURL)
+            defer { document.removeTemporaryFiles() }
+            let securedChapter = try String(contentsOf: document.mainDocumentURL, encoding: .utf8)
+            #expect(securedChapter.contains("UTF-8"))
+            #expect(securedChapter.contains("Content-Security-Policy"))
+        }
+    }
+
+    @Test func readerSupportsUTF16BigEndianBOMAndNoBOMDeclaredEncoding() throws {
+        let packageXML = """
+        <package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+            <manifest><item id="chapter" href="Text/chapter.xhtml" media-type="application/xhtml+xml"/></manifest>
+            <spine><itemref idref="chapter"/></spine>
+        </package>
+        """
+        let chapter = "<?xml version=\"1.0\" encoding=\"UTF-16\"?><html><body><h1>UTF-16</h1></body></html>"
+        let variants = [makeUTF16BEData(chapter), makeUTF16BEDataWithoutBOM(chapter)]
+        let rootDirectory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: rootDirectory) }
+
+        for (index, chapterData) in variants.enumerated() {
+            let epubURL = rootDirectory.appendingPathComponent("utf16-be-\(index).epub")
+            try makeReaderEPUBData(
+                packageXML: packageXML,
+                binaryResources: [("OEBPS/Text/chapter.xhtml", chapterData)]
+            ).write(to: epubURL)
+            let document = try EPUBBookReader().prepareReadingDocument(from: epubURL)
+            defer { document.removeTemporaryFiles() }
+            let securedChapter = try String(contentsOf: document.mainDocumentURL, encoding: .utf8)
+            #expect(securedChapter.contains("UTF-16"))
+            #expect(securedChapter.contains("encoding=\"UTF-8\""))
+            #expect(securedChapter.contains("Content-Security-Policy"))
+        }
+    }
+
+    @Test func readerRejectsMismatchedBOMAndXMLDeclarationEncoding() throws {
+        let packageXML = """
+        <package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+            <manifest><item id="chapter" href="Text/chapter.xhtml" media-type="application/xhtml+xml"/></manifest>
+            <spine><itemref idref="chapter"/></spine>
+        </package>
+        """
+        let variants = [
+            makeUTF16LEData("<?xml version=\"1.0\" encoding=\"UTF-8\"?><html><body>Mismatch</body></html>"),
+            Data([0xef, 0xbb, 0xbf]) + Data("<?xml version=\"1.0\" encoding=\"UTF-16\"?><html><body>Mismatch</body></html>".utf8),
+            makeUTF16LEDataWithoutBOM("<?xml version=\"1.0\" encoding=\"UTF-16BE\"?><html><body>Mismatch</body></html>")
+        ]
+        let rootDirectory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: rootDirectory) }
+
+        for (index, chapterData) in variants.enumerated() {
+            let epubURL = rootDirectory.appendingPathComponent("mismatch-\(index).epub")
+            try makeReaderEPUBData(
+                packageXML: packageXML,
+                binaryResources: [("OEBPS/Text/chapter.xhtml", chapterData)]
+            ).write(to: epubURL)
+            do {
+                _ = try EPUBBookReader().prepareReadingDocument(from: epubURL)
+                #expect(Bool(false))
+            } catch {
+                #expect(error as? EPUBReaderError == .invalidEPUB)
+            }
+        }
     }
 
     @Test func readerRejectsChapterWithUnknownEncoding() throws {
@@ -860,6 +1006,239 @@ struct peekturn_iosTests {
     }
 }
 
+struct readerWebKitIntegrationTests {
+    @Test @MainActor func readerWKWebViewLoadsLocalCSSImageAndFontAndBlocksExternalResource() async throws {
+        let fileManager = FileManager.default
+        let rootDirectory = try makeTemporaryDirectory()
+        defer { try? fileManager.removeItem(at: rootDirectory) }
+
+        try Data("body { color: rgb(10, 20, 30); }".utf8)
+            .write(to: rootDirectory.appendingPathComponent("reader.css"))
+        try #require(onePixelPNGData()).write(to: rootDirectory.appendingPathComponent("pixel.png"))
+        let fontSource = try #require([
+            "/System/Library/Fonts/SFNS.ttf",
+            "/System/Library/Fonts/Helvetica.ttc",
+            "/System/Library/Fonts/CoreUI/SFUI.ttf"
+        ].map(URL.init(fileURLWithPath:)).first { fileManager.fileExists(atPath: $0.path) })
+        try Data(contentsOf: fontSource)
+            .write(to: rootDirectory.appendingPathComponent("reader-font.ttf"))
+
+        let rawHTML = """
+        <!doctype html>
+        <html><head>
+            <link rel="stylesheet" type="text/css" href="reader.css">
+            <style>@font-face { font-family: LocalReaderFont; src: url('reader-font.ttf'); }</style>
+        </head><body>
+            <img id="local-image" src="pixel.png">
+            <img id="external-image" src="https://example.com/remote.png">
+            <p style="font-family: LocalReaderFont">Local font</p>
+        </body></html>
+        """
+        let policy = try #require(try? ReaderSecurityPolicy.make().get())
+        let securedHTML = try ReaderHTMLSecurity.securedData(
+            from: Data(rawHTML.utf8),
+            policy: policy
+        )
+        let chapterURL = rootDirectory.appendingPathComponent("chapter.html")
+        try securedHTML.write(to: chapterURL)
+
+        let waiter = ReaderWebKitLoadWaiter()
+        let coordinator = ReaderWebViewCoordinator(onFinish: { waiter.succeed() })
+        let webView = makeReaderWebView(coordinator: coordinator)
+        try await waiter.wait(
+            coordinator: coordinator,
+            webView: webView,
+            documentURL: chapterURL,
+            readAccessDirectory: rootDirectory
+        )
+        try await Task.sleep(nanoseconds: 1_000_000_000)
+
+        let result = try await webView.evaluateJavaScript("""
+        (function() {
+            const body = document.querySelector('body');
+            const localImage = document.querySelector('#local-image');
+            const externalImage = document.querySelector('#external-image');
+            return JSON.stringify({
+                css: body != null && getComputedStyle(body).color === 'rgb(10, 20, 30)',
+                image: localImage != null && localImage.complete && localImage.naturalWidth > 0,
+                font: document.fonts != null && document.fonts.check('16px LocalReaderFont'),
+                external: externalImage != null && externalImage.naturalWidth === 0
+            });
+        })()
+        """) as? String
+        let resultString = try #require(result)
+        let resultData = try #require(resultString.data(using: .utf8))
+        let checks = try #require(try JSONSerialization.jsonObject(with: resultData) as? [String: Bool])
+        #expect(checks["css"] == true)
+        #expect(checks["image"] == true)
+        #expect(checks["font"] == true)
+        #expect(checks["external"] == true)
+    }
+
+    @Test @MainActor func readerWKWebViewBlocksExternalNavigationAndRedirect() async throws {
+        let rootDirectory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: rootDirectory) }
+        let chapterURL = rootDirectory.appendingPathComponent("chapter.xhtml")
+        try Data("<html><body>Local</body></html>".utf8).write(to: chapterURL)
+
+        let waiter = ReaderWebKitLoadWaiter()
+        let coordinator = ReaderWebViewCoordinator(onFinish: { waiter.succeed() })
+        let webView = makeReaderWebView(coordinator: coordinator)
+        try await waiter.wait(
+            coordinator: coordinator,
+            webView: webView,
+            documentURL: chapterURL,
+            readAccessDirectory: rootDirectory
+        )
+        let localURL = try #require(webView.url)
+
+        let externalURL = try #require(URL(string: "https://example.com/reader.xhtml"))
+        webView.load(URLRequest(url: externalURL))
+        try await Task.sleep(nanoseconds: 300_000_000)
+        #expect(webView.url == localURL)
+
+        let redirectURL = rootDirectory.appendingPathComponent("redirect.xhtml")
+        try Data("<meta http-equiv=\"refresh\" content=\"0;url=https://example.com/redirected\"><p>Redirect</p>".utf8)
+            .write(to: redirectURL)
+        let redirectWaiter = ReaderWebKitLoadWaiter()
+        let redirectCoordinator = ReaderWebViewCoordinator(onFinish: { redirectWaiter.succeed() })
+        let redirectWebView = makeReaderWebView(coordinator: redirectCoordinator)
+        try await redirectWaiter.wait(
+            coordinator: redirectCoordinator,
+            webView: redirectWebView,
+            documentURL: redirectURL,
+            readAccessDirectory: rootDirectory
+        )
+        try await Task.sleep(nanoseconds: 500_000_000)
+        #expect(redirectWebView.url?.isFileURL == true)
+    }
+
+    @Test @MainActor func readerWKWebViewFailsClosedWhenContentRuleListCompilationFails() async throws {
+        let rootDirectory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: rootDirectory) }
+        let chapterURL = rootDirectory.appendingPathComponent("chapter.xhtml")
+        try Data("<html><body>Must not load</body></html>".utf8).write(to: chapterURL)
+
+        let invalidPolicy = ReaderSecurityPolicy(
+            contentSecurityPolicy: "default-src 'self'",
+            encodedContentRuleList: "not-json"
+        )
+        let waiter = ReaderWebKitLoadWaiter()
+        let coordinator = ReaderWebViewCoordinator(
+            securityPolicyProvider: { .success(invalidPolicy) },
+            onFinish: { waiter.succeed() }
+        )
+        let webView = makeReaderWebView(coordinator: coordinator)
+
+        do {
+            try await waiter.wait(
+                coordinator: coordinator,
+                webView: webView,
+                documentURL: chapterURL,
+                readAccessDirectory: rootDirectory
+            )
+            #expect(Bool(false))
+        } catch {
+            #expect(error is ReaderWebKitTestError)
+        }
+        #expect(webView.url == nil)
+    }
+
+    @Test @MainActor func readerWKWebViewFailureAndRetryUseRealNavigationCallbacks() async throws {
+        let rootDirectory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: rootDirectory) }
+        let missingURL = rootDirectory.appendingPathComponent("missing.xhtml")
+
+        let failureWaiter = ReaderWebKitLoadWaiter()
+        let failureCoordinator = ReaderWebViewCoordinator(onFinish: { failureWaiter.succeed() })
+        let failureWebView = makeReaderWebView(coordinator: failureCoordinator)
+        do {
+            try await failureWaiter.wait(
+                coordinator: failureCoordinator,
+                webView: failureWebView,
+                documentURL: missingURL,
+                readAccessDirectory: rootDirectory
+            )
+            #expect(Bool(false))
+        } catch {
+            #expect(error is ReaderWebKitTestError)
+        }
+
+        let validURL = rootDirectory.appendingPathComponent("retry.xhtml")
+        try Data("<html><body>Recovered</body></html>".utf8).write(to: validURL)
+        let retryWaiter = ReaderWebKitLoadWaiter()
+        let retryCoordinator = ReaderWebViewCoordinator(onFinish: { retryWaiter.succeed() })
+        let retryWebView = makeReaderWebView(coordinator: retryCoordinator)
+        try await retryWaiter.wait(
+            coordinator: retryCoordinator,
+            webView: retryWebView,
+            documentURL: validURL,
+            readAccessDirectory: rootDirectory
+        )
+        #expect(retryWebView.url?.isFileURL == true)
+        let body = try await retryWebView.evaluateJavaScript("document.documentElement.textContent") as? String
+        #expect(body?.contains("Recovered") == true)
+    }
+}
+
+private enum ReaderWebKitTestError: Error {
+    case failed(String)
+}
+
+@MainActor
+private final class ReaderWebKitLoadWaiter {
+    private var continuation: CheckedContinuation<Void, Error>?
+    private var isComplete = false
+
+    func wait(
+        coordinator: ReaderWebViewCoordinator,
+        webView: WKWebView,
+        documentURL: URL,
+        readAccessDirectory: URL
+    ) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            self.continuation = continuation
+            self.isComplete = false
+            coordinator.prepareToLoad(
+                webView: webView,
+                documentURL: documentURL,
+                readAccessDirectory: readAccessDirectory,
+                onFailure: { [weak self] message in
+                    self?.fail(message)
+                }
+            )
+        }
+    }
+
+    func succeed() {
+        guard !isComplete else { return }
+        isComplete = true
+        continuation?.resume()
+        continuation = nil
+    }
+
+    private func fail(_ message: String) {
+        guard !isComplete else { return }
+        isComplete = true
+        continuation?.resume(throwing: ReaderWebKitTestError.failed(message))
+        continuation = nil
+    }
+}
+
+@MainActor
+private func makeReaderWebView(coordinator: ReaderWebViewCoordinator) -> WKWebView {
+    let configuration = WKWebViewConfiguration()
+    configuration.userContentController = WKUserContentController()
+    configuration.defaultWebpagePreferences.allowsContentJavaScript = false
+    let webView = WKWebView(frame: .zero, configuration: configuration)
+    webView.navigationDelegate = coordinator
+    return webView
+}
+
+private func onePixelPNGData() -> Data? {
+    Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+}
+
 private final class FailingBookRepositoryFileSystem: BookRepositoryFileSystem {
     private let fileManager = FileManager.default
 
@@ -1179,6 +1558,30 @@ private func replaceUInt32(_ value: UInt32, in data: inout Data, at offset: Int)
 
 private func makeUTF16LEData(_ string: String) -> Data {
     var data = Data([0xff, 0xfe])
+    for codeUnit in string.utf16 {
+        data.append(UInt8(codeUnit & 0xff))
+        data.append(UInt8((codeUnit >> 8) & 0xff))
+    }
+    return data
+}
+
+private func makeUTF16BEData(_ string: String) -> Data {
+    var data = Data([0xfe, 0xff])
+    data.append(contentsOf: makeUTF16BEDataWithoutBOM(string))
+    return data
+}
+
+private func makeUTF16BEDataWithoutBOM(_ string: String) -> Data {
+    var data = Data()
+    for codeUnit in string.utf16 {
+        data.append(UInt8((codeUnit >> 8) & 0xff))
+        data.append(UInt8(codeUnit & 0xff))
+    }
+    return data
+}
+
+private func makeUTF16LEDataWithoutBOM(_ string: String) -> Data {
+    var data = Data()
     for codeUnit in string.utf16 {
         data.append(UInt8(codeUnit & 0xff))
         data.append(UInt8((codeUnit >> 8) & 0xff))

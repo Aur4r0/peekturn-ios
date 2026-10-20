@@ -81,8 +81,8 @@ private struct EPUBWebView: UIViewRepresentable {
     let readAccessDirectory: URL
     let onFailure: (String) -> Void
 
-    func makeCoordinator() -> Coordinator {
-        Coordinator()
+    func makeCoordinator() -> ReaderWebViewCoordinator {
+        ReaderWebViewCoordinator()
     }
 
     func makeUIView(context: Context) -> WKWebView {
@@ -112,110 +112,128 @@ private struct EPUBWebView: UIViewRepresentable {
         )
     }
 
-    final class Coordinator: NSObject, WKNavigationDelegate {
-        private var hasStartedLoading = false
-        private var readAccessDirectory: URL?
-        private var onFailure: ((String) -> Void)?
+}
 
-        func prepareToLoad(
-            webView: WKWebView,
-            documentURL: URL,
-            readAccessDirectory: URL,
-            onFailure: @escaping (String) -> Void
-        ) {
-            self.onFailure = onFailure
-            guard !hasStartedLoading else { return }
-            hasStartedLoading = true
-            self.readAccessDirectory = readAccessDirectory
+final class ReaderWebViewCoordinator: NSObject, WKNavigationDelegate {
+    private let securityPolicyProvider: () -> Result<ReaderSecurityPolicy, ReaderSecurityPolicyError>
+    private let onFinish: () -> Void
+    private var hasStartedLoading = false
+    private var readAccessDirectory: URL?
+    private var onFailure: ((String) -> Void)?
 
-            guard case .success(let securityPolicy) = ReaderSecurityPolicy.make() else {
-                reportFailure("Reader security could not be initialized.")
-                return
-            }
+    init(
+        securityPolicyProvider: @escaping () -> Result<ReaderSecurityPolicy, ReaderSecurityPolicyError> = {
+            ReaderSecurityPolicy.make()
+        },
+        onFinish: @escaping () -> Void = {}
+    ) {
+        self.securityPolicyProvider = securityPolicyProvider
+        self.onFinish = onFinish
+        super.init()
+    }
 
-            WKContentRuleListStore.default().compileContentRuleList(
-                forIdentifier: "PeekturnReaderBlockExternalNetwork",
-                encodedContentRuleList: securityPolicy.encodedContentRuleList
-            ) { [weak self, weak webView] ruleList, error in
-                DispatchQueue.main.async {
-                    guard let self, let webView else { return }
-                    guard let ruleList else {
-                        self.reportFailure(
-                            error?.localizedDescription ?? "Reader security could not be initialized."
-                        )
-                        return
-                    }
-                    webView.configuration.userContentController.add(ruleList)
-                    webView.loadFileURL(
-                        documentURL,
-                        allowingReadAccessTo: readAccessDirectory
+    func prepareToLoad(
+        webView: WKWebView,
+        documentURL: URL,
+        readAccessDirectory: URL,
+        onFailure: @escaping (String) -> Void
+    ) {
+        self.onFailure = onFailure
+        guard !hasStartedLoading else { return }
+        hasStartedLoading = true
+        self.readAccessDirectory = readAccessDirectory
+
+        guard case .success(let securityPolicy) = securityPolicyProvider() else {
+            reportFailure("Reader security could not be initialized.")
+            return
+        }
+
+        WKContentRuleListStore.default().compileContentRuleList(
+            forIdentifier: "PeekturnReaderBlockExternalNetwork",
+            encodedContentRuleList: securityPolicy.encodedContentRuleList
+        ) { [weak self, weak webView] ruleList, error in
+            DispatchQueue.main.async {
+                guard let self, let webView else { return }
+                guard let ruleList else {
+                    self.reportFailure(
+                        error?.localizedDescription ?? "Reader security could not be initialized."
                     )
+                    return
                 }
+                webView.configuration.userContentController.add(ruleList)
+                webView.loadFileURL(
+                    documentURL,
+                    allowingReadAccessTo: readAccessDirectory
+                )
             }
         }
+    }
 
-        func webView(
-            _ webView: WKWebView,
-            decidePolicyFor navigationAction: WKNavigationAction,
-            decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
-        ) {
-            guard let url = navigationAction.request.url,
-                  let readAccessDirectory else {
-                decisionHandler(.cancel)
-                return
-            }
-
-            decisionHandler(
-                ReaderNavigationPolicy.allowsNavigation(url, inside: readAccessDirectory)
-                    ? .allow
-                    : .cancel
-            )
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationAction: WKNavigationAction,
+        decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+    ) {
+        guard let url = navigationAction.request.url,
+              let readAccessDirectory else {
+            decisionHandler(.cancel)
+            return
         }
 
-        func webView(
-            _ webView: WKWebView,
-            decidePolicyFor navigationResponse: WKNavigationResponse,
-            decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
-        ) {
-            guard let url = navigationResponse.response.url,
-                  let readAccessDirectory else {
-                decisionHandler(.cancel)
-                return
-            }
+        decisionHandler(
+            ReaderNavigationPolicy.allowsNavigation(url, inside: readAccessDirectory)
+                ? .allow
+                : .cancel
+        )
+    }
 
-            decisionHandler(
-                ReaderNavigationPolicy.allowsResourceRequest(url, inside: readAccessDirectory)
-                    ? .allow
-                    : .cancel
-            )
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationResponse: WKNavigationResponse,
+        decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
+    ) {
+        guard let url = navigationResponse.response.url,
+              let readAccessDirectory else {
+            decisionHandler(.cancel)
+            return
         }
 
-        func webView(
-            _ webView: WKWebView,
-            didFail navigation: WKNavigation!,
-            withError error: Error
-        ) {
-            reportFailure(error.localizedDescription)
-        }
+        decisionHandler(
+            ReaderNavigationPolicy.allowsResourceRequest(url, inside: readAccessDirectory)
+                ? .allow
+                : .cancel
+        )
+    }
 
-        func webView(
-            _ webView: WKWebView,
-            didFailProvisionalNavigation navigation: WKNavigation!,
-            withError error: Error
-        ) {
-            reportFailure(error.localizedDescription)
-        }
+    func webView(
+        _ webView: WKWebView,
+        didFail navigation: WKNavigation!,
+        withError error: Error
+    ) {
+        reportFailure(error.localizedDescription)
+    }
 
-        func webView(
-            _ webView: WKWebView,
-            didReceiveServerRedirectForProvisionalNavigation navigation: WKNavigation!
-        ) {
-            webView.stopLoading()
-            reportFailure("External redirects are not allowed.")
-        }
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        onFinish()
+    }
 
-        private func reportFailure(_ message: String) {
-            onFailure?(message)
-        }
+    func webView(
+        _ webView: WKWebView,
+        didFailProvisionalNavigation navigation: WKNavigation!,
+        withError error: Error
+    ) {
+        reportFailure(error.localizedDescription)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        didReceiveServerRedirectForProvisionalNavigation navigation: WKNavigation!
+    ) {
+        webView.stopLoading()
+        reportFailure("External redirects are not allowed.")
+    }
+
+    private func reportFailure(_ message: String) {
+        onFailure?(message)
     }
 }
