@@ -3,6 +3,7 @@ import Foundation
 enum BookRepositoryError: LocalizedError, Equatable {
     case invalidLibraryData
     case invalidBookFileName
+    case transactionRecoveryFailed
 
     var errorDescription: String? {
         switch self {
@@ -10,7 +11,37 @@ enum BookRepositoryError: LocalizedError, Equatable {
             return "The local library could not be read."
         case .invalidBookFileName:
             return "The local book file name is invalid."
+        case .transactionRecoveryFailed:
+            return "The local library could not be updated safely."
         }
+    }
+}
+
+protocol BookRepositoryFileSystem {
+    func fileExists(atPath path: String) -> Bool
+    func createDirectory(at url: URL, withIntermediateDirectories createIntermediates: Bool) throws
+    func readData(from url: URL) throws -> Data
+    func write(_ data: Data, to url: URL, options: Data.WritingOptions) throws
+    func copyItem(at srcURL: URL, to dstURL: URL) throws
+    func moveItem(at srcURL: URL, to dstURL: URL) throws
+    func removeItem(at url: URL) throws
+}
+
+extension FileManager: BookRepositoryFileSystem {
+    func createDirectory(at url: URL, withIntermediateDirectories createIntermediates: Bool) throws {
+        try createDirectory(
+            at: url,
+            withIntermediateDirectories: createIntermediates,
+            attributes: nil
+        )
+    }
+
+    func readData(from url: URL) throws -> Data {
+        try Data(contentsOf: url)
+    }
+
+    func write(_ data: Data, to url: URL, options: Data.WritingOptions) throws {
+        try data.write(to: url, options: options)
     }
 }
 
@@ -19,18 +50,18 @@ final class BookRepository {
     let booksDirectory: URL
 
     private let libraryFileURL: URL
-    private let fileManager: FileManager
+    private let fileSystem: BookRepositoryFileSystem
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
 
     init(
         rootDirectory: URL = BookRepository.defaultRootDirectory(),
-        fileManager: FileManager = .default
+        fileSystem: BookRepositoryFileSystem = FileManager.default
     ) {
         self.rootDirectory = rootDirectory
         self.booksDirectory = rootDirectory.appendingPathComponent("Books", isDirectory: true)
         self.libraryFileURL = rootDirectory.appendingPathComponent("library.json", isDirectory: false)
-        self.fileManager = fileManager
+        self.fileSystem = fileSystem
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -41,12 +72,12 @@ final class BookRepository {
     func fetchAll() throws -> [Book] {
         try prepareDirectories()
 
-        guard fileManager.fileExists(atPath: libraryFileURL.path) else {
+        guard fileSystem.fileExists(atPath: libraryFileURL.path) else {
             return []
         }
 
         do {
-            let data = try Data(contentsOf: libraryFileURL)
+            let data = try fileSystem.readData(from: libraryFileURL)
             return try decoder.decode([Book].self, from: data)
         } catch {
             throw BookRepositoryError.invalidLibraryData
@@ -65,7 +96,7 @@ final class BookRepository {
         }
 
         let data = try encoder.encode(books)
-        try data.write(to: libraryFileURL, options: .atomic)
+        try fileSystem.write(data, to: libraryFileURL, options: .atomic)
     }
 
     func delete(_ book: Book) throws {
@@ -76,14 +107,65 @@ final class BookRepository {
         books.removeAll { $0.id == book.id }
 
         let data = try encoder.encode(books)
-        try data.write(to: libraryFileURL, options: .atomic)
+        let transactionID = UUID().uuidString
+        let temporaryLibraryURL = rootDirectory.appendingPathComponent(
+            ".library-\(transactionID).tmp",
+            isDirectory: false
+        )
+        let libraryBackupURL = rootDirectory.appendingPathComponent(
+            ".library-\(transactionID).backup",
+            isDirectory: false
+        )
+        let bookURL = book.epubFileName.isEmpty
+            ? nil
+            : booksDirectory.appendingPathComponent(book.epubFileName, isDirectory: false)
+        let bookBackupURL = booksDirectory.appendingPathComponent(
+            ".delete-\(transactionID).backup",
+            isDirectory: false
+        )
 
-        if !book.epubFileName.isEmpty {
-            let fileURL = booksDirectory.appendingPathComponent(book.epubFileName, isDirectory: false)
-            if fileManager.fileExists(atPath: fileURL.path) {
-                try fileManager.removeItem(at: fileURL)
+        let libraryWasPresent = fileSystem.fileExists(atPath: libraryFileURL.path)
+        let bookWasPresent = bookURL.map { fileSystem.fileExists(atPath: $0.path) } ?? false
+
+        do {
+            if libraryWasPresent {
+                try fileSystem.copyItem(at: libraryFileURL, to: libraryBackupURL)
             }
+            if bookWasPresent, let bookURL {
+                try fileSystem.copyItem(at: bookURL, to: bookBackupURL)
+            }
+
+            try fileSystem.write(data, to: temporaryLibraryURL, options: .atomic)
+
+            if bookWasPresent, let bookURL {
+                try fileSystem.removeItem(at: bookURL)
+            }
+
+            if libraryWasPresent {
+                try fileSystem.removeItem(at: libraryFileURL)
+            }
+            try fileSystem.moveItem(at: temporaryLibraryURL, to: libraryFileURL)
+        } catch {
+            do {
+                try recoverDeleteTransaction(
+                    temporaryLibraryURL: temporaryLibraryURL,
+                    libraryBackupURL: libraryBackupURL,
+                    libraryWasPresent: libraryWasPresent,
+                    bookURL: bookURL,
+                    bookBackupURL: bookBackupURL,
+                    bookWasPresent: bookWasPresent
+                )
+            } catch {
+                throw BookRepositoryError.transactionRecoveryFailed
+            }
+            throw error
         }
+
+        // The new library is already durable. Orphaned backups are harmless and
+        // can be removed opportunistically without changing the committed state.
+        removeIfPresent(temporaryLibraryURL)
+        removeIfPresent(libraryBackupURL)
+        removeIfPresent(bookBackupURL)
     }
 
     func fileURL(for book: Book) throws -> URL? {
@@ -95,8 +177,46 @@ final class BookRepository {
     }
 
     private func prepareDirectories() throws {
-        try fileManager.createDirectory(at: rootDirectory, withIntermediateDirectories: true)
-        try fileManager.createDirectory(at: booksDirectory, withIntermediateDirectories: true)
+        try fileSystem.createDirectory(at: rootDirectory, withIntermediateDirectories: true)
+        try fileSystem.createDirectory(at: booksDirectory, withIntermediateDirectories: true)
+    }
+
+    private func recoverDeleteTransaction(
+        temporaryLibraryURL: URL,
+        libraryBackupURL: URL,
+        libraryWasPresent: Bool,
+        bookURL: URL?,
+        bookBackupURL: URL,
+        bookWasPresent: Bool
+    ) throws {
+        removeIfPresent(temporaryLibraryURL)
+
+        if libraryWasPresent {
+            if !fileSystem.fileExists(atPath: libraryFileURL.path),
+               fileSystem.fileExists(atPath: libraryBackupURL.path) {
+                try fileSystem.moveItem(at: libraryBackupURL, to: libraryFileURL)
+            } else {
+                removeIfPresent(libraryBackupURL)
+            }
+        } else {
+            removeIfPresent(libraryFileURL)
+            removeIfPresent(libraryBackupURL)
+        }
+
+        if bookWasPresent, let bookURL {
+            if fileSystem.fileExists(atPath: bookURL.path) {
+                removeIfPresent(bookBackupURL)
+            } else if fileSystem.fileExists(atPath: bookBackupURL.path) {
+                try fileSystem.moveItem(at: bookBackupURL, to: bookURL)
+            }
+        } else {
+            removeIfPresent(bookBackupURL)
+        }
+    }
+
+    private func removeIfPresent(_ url: URL) {
+        guard fileSystem.fileExists(atPath: url.path) else { return }
+        try? fileSystem.removeItem(at: url)
     }
 
     private func validateFileNameIfPresent(_ fileName: String) throws {

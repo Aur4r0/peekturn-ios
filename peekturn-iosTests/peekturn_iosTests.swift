@@ -62,6 +62,35 @@ struct peekturn_iosTests {
         #expect(remainingFiles.isEmpty)
     }
 
+    @Test func importerRejectsEPUBWithUnreasonableUncompressedSize() throws {
+        let fileManager = FileManager.default
+        let rootDirectory = try makeTemporaryDirectory()
+        defer { try? fileManager.removeItem(at: rootDirectory) }
+
+        let sourceURL = rootDirectory.appendingPathComponent("oversized.epub")
+        let oversizedArchive = replacingFirstCentralDirectoryUncompressedSize(
+            in: makeEPUBData(title: "Book", author: "Author"),
+            with: .max
+        )
+        try oversizedArchive.write(to: sourceURL)
+
+        let storageDirectory = rootDirectory.appendingPathComponent("PrivateBooks", isDirectory: true)
+        let importer = BookImporter(storageDirectory: storageDirectory)
+
+        do {
+            _ = try importer.importBook(from: sourceURL)
+            #expect(Bool(false))
+        } catch {
+            #expect(error as? BookImportError == .invalidEPUB)
+        }
+
+        let remainingFiles = try fileManager.contentsOfDirectory(
+            at: storageDirectory,
+            includingPropertiesForKeys: nil
+        )
+        #expect(remainingFiles.isEmpty)
+    }
+
     @Test func repositoryPersistsAndDeletesBookAndFile() throws {
         let fileManager = FileManager.default
         let rootDirectory = try makeTemporaryDirectory()
@@ -101,6 +130,144 @@ struct peekturn_iosTests {
             #expect(error as? BookRepositoryError == .invalidLibraryData)
         }
     }
+
+    @Test func repositoryKeepsBookAndMetadataWhenBookDeletionFails() throws {
+        let fileManager = FileManager.default
+        let rootDirectory = try makeTemporaryDirectory()
+        defer { try? fileManager.removeItem(at: rootDirectory) }
+
+        let failingFileSystem = FailingBookRepositoryFileSystem()
+        let repository = BookRepository(rootDirectory: rootDirectory, fileSystem: failingFileSystem)
+        let book = Book(title: "Book", author: "Author", epubFileName: "book.epub")
+        let storedURL = try #require(try repository.fileURL(for: book))
+        let originalData = Data("epub".utf8)
+        try fileManager.createDirectory(at: repository.booksDirectory, withIntermediateDirectories: true)
+        try originalData.write(to: storedURL)
+        try repository.save(book)
+
+        failingFileSystem.failingRemovalPaths = [storedURL.standardizedFileURL.path]
+
+        do {
+            try repository.delete(book)
+            #expect(Bool(false))
+        } catch {
+            #expect(error is TestFileSystemError)
+        }
+
+        #expect(try repository.fetchAll() == [book])
+        #expect(fileManager.fileExists(atPath: storedURL.path))
+        #expect(try Data(contentsOf: storedURL) == originalData)
+    }
+
+    @Test func repositoryKeepsBookAndMetadataWhenTemporaryMetadataWriteFails() throws {
+        let fileManager = FileManager.default
+        let rootDirectory = try makeTemporaryDirectory()
+        defer { try? fileManager.removeItem(at: rootDirectory) }
+
+        let failingFileSystem = FailingBookRepositoryFileSystem()
+        let repository = BookRepository(rootDirectory: rootDirectory, fileSystem: failingFileSystem)
+        let book = Book(title: "Book", author: "Author", epubFileName: "book.epub")
+        let storedURL = try #require(try repository.fileURL(for: book))
+        try fileManager.createDirectory(at: repository.booksDirectory, withIntermediateDirectories: true)
+        try Data("epub".utf8).write(to: storedURL)
+        try repository.save(book)
+
+        failingFileSystem.failTemporaryLibraryWrite = true
+
+        do {
+            try repository.delete(book)
+            #expect(Bool(false))
+        } catch {
+            #expect(error is TestFileSystemError)
+        }
+
+        #expect(try repository.fetchAll() == [book])
+        #expect(fileManager.fileExists(atPath: storedURL.path))
+    }
+
+    @Test func repositoryRestoresStateWhenLibraryReplacementFailsAfterBookRemoval() throws {
+        let fileManager = FileManager.default
+        let rootDirectory = try makeTemporaryDirectory()
+        defer { try? fileManager.removeItem(at: rootDirectory) }
+
+        let failingFileSystem = FailingBookRepositoryFileSystem()
+        let repository = BookRepository(rootDirectory: rootDirectory, fileSystem: failingFileSystem)
+        let book = Book(title: "Book", author: "Author", epubFileName: "book.epub")
+        let storedURL = try #require(try repository.fileURL(for: book))
+        let originalData = Data("epub".utf8)
+        try fileManager.createDirectory(at: repository.booksDirectory, withIntermediateDirectories: true)
+        try originalData.write(to: storedURL)
+        try repository.save(book)
+
+        failingFileSystem.failLibraryReplacement = true
+
+        do {
+            try repository.delete(book)
+            #expect(Bool(false))
+        } catch {
+            #expect(error is TestFileSystemError)
+        }
+
+        #expect(try repository.fetchAll() == [book])
+        #expect(fileManager.fileExists(atPath: storedURL.path))
+        #expect(try Data(contentsOf: storedURL) == originalData)
+    }
+}
+
+private final class FailingBookRepositoryFileSystem: BookRepositoryFileSystem {
+    private let fileManager = FileManager.default
+
+    var failingRemovalPaths = Set<String>()
+    var failTemporaryLibraryWrite = false
+    var failLibraryReplacement = false
+
+    func fileExists(atPath path: String) -> Bool {
+        fileManager.fileExists(atPath: path)
+    }
+
+    func createDirectory(at url: URL, withIntermediateDirectories createIntermediates: Bool) throws {
+        try fileManager.createDirectory(at: url, withIntermediateDirectories: createIntermediates)
+    }
+
+    func readData(from url: URL) throws -> Data {
+        try Data(contentsOf: url)
+    }
+
+    func write(_ data: Data, to url: URL, options: Data.WritingOptions) throws {
+        if failTemporaryLibraryWrite,
+           url.lastPathComponent.hasPrefix(".library-"),
+           url.pathExtension == "tmp" {
+            throw TestFileSystemError.writeFailed
+        }
+        try data.write(to: url, options: options)
+    }
+
+    func copyItem(at srcURL: URL, to dstURL: URL) throws {
+        try fileManager.copyItem(at: srcURL, to: dstURL)
+    }
+
+    func moveItem(at srcURL: URL, to dstURL: URL) throws {
+        if failLibraryReplacement,
+           srcURL.lastPathComponent.hasPrefix(".library-"),
+           srcURL.pathExtension == "tmp",
+           dstURL.lastPathComponent == "library.json" {
+            throw TestFileSystemError.moveFailed
+        }
+        try fileManager.moveItem(at: srcURL, to: dstURL)
+    }
+
+    func removeItem(at url: URL) throws {
+        if failingRemovalPaths.contains(url.standardizedFileURL.path) {
+            throw TestFileSystemError.removeFailed
+        }
+        try fileManager.removeItem(at: url)
+    }
+}
+
+private enum TestFileSystemError: Error {
+    case removeFailed
+    case writeFailed
+    case moveFailed
 }
 
 private func makeTemporaryDirectory() throws -> URL {
@@ -135,6 +302,25 @@ private func makeEPUBData(title: String, author: String) -> Data {
         ("META-INF/container.xml", containerXML),
         ("OEBPS/content.opf", packageXML)
     ])
+}
+
+private func replacingFirstCentralDirectoryUncompressedSize(in data: Data, with size: UInt32) -> Data {
+    var result = data
+    for offset in 0..<(result.count - 46) {
+        guard result[offset] == 0x50,
+              result[offset + 1] == 0x4b,
+              result[offset + 2] == 0x01,
+              result[offset + 3] == 0x02 else {
+            continue
+        }
+
+        result[offset + 24] = UInt8(size & 0xff)
+        result[offset + 25] = UInt8((size >> 8) & 0xff)
+        result[offset + 26] = UInt8((size >> 16) & 0xff)
+        result[offset + 27] = UInt8((size >> 24) & 0xff)
+        break
+    }
+    return result
 }
 
 private func makeStoredZIP(entries: [(String, Data)]) -> Data {

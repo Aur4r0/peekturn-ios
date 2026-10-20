@@ -2,6 +2,8 @@ import Foundation
 import UniformTypeIdentifiers
 import zlib
 
+private let maxUncompressedZIPEntrySize = 64 * 1024 * 1024
+
 enum BookImportError: LocalizedError, Equatable {
     case unsupportedFileType
     case sourceUnavailable
@@ -204,11 +206,13 @@ private struct ZIPArchive {
         let nameLength = Int(data.uint16(at: entry.localHeaderOffset + 26))
         let extraLength = Int(data.uint16(at: entry.localHeaderOffset + 28))
         let contentOffset = entry.localHeaderOffset + 30 + nameLength + extraLength
-        let contentEnd = contentOffset + entry.compressedSize
-        guard contentOffset >= 0, contentEnd <= data.count else {
+        guard contentOffset >= 0,
+              contentOffset <= data.count,
+              entry.compressedSize <= data.count - contentOffset else {
             throw EPUBArchiveError.invalidEPUB
         }
 
+        let contentEnd = contentOffset + entry.compressedSize
         let compressedData = data.subdata(in: contentOffset..<contentEnd)
         switch entry.compressionMethod {
         case 0:
@@ -248,14 +252,16 @@ private struct ZIPArchive {
 
             let compressionMethod = data.uint16(at: offset + 10)
             let compressedSize = Int(data.uint32(at: offset + 20))
-            let uncompressedSize = Int(data.uint32(at: offset + 24))
+            let declaredUncompressedSize = UInt64(data.uint32(at: offset + 24))
             let nameLength = Int(data.uint16(at: offset + 28))
             let extraLength = Int(data.uint16(at: offset + 30))
             let commentLength = Int(data.uint16(at: offset + 32))
             let localHeaderOffset = Int(data.uint32(at: offset + 42))
             let nameStart = offset + 46
             let nameEnd = nameStart + nameLength
-            guard nameEnd <= data.count,
+            guard declaredUncompressedSize <= UInt64(maxUncompressedZIPEntrySize),
+                  compressedSize <= maxUncompressedZIPEntrySize,
+                  nameEnd <= data.count,
                   let name = String(data: data.subdata(in: nameStart..<nameEnd), encoding: .utf8) else {
                 throw EPUBArchiveError.invalidEPUB
             }
@@ -263,7 +269,7 @@ private struct ZIPArchive {
             entries[name] = Entry(
                 compressionMethod: compressionMethod,
                 compressedSize: compressedSize,
-                uncompressedSize: uncompressedSize,
+                uncompressedSize: Int(declaredUncompressedSize),
                 localHeaderOffset: localHeaderOffset
             )
             offset = nameEnd + extraLength + commentLength
@@ -361,7 +367,11 @@ private final class PackageXMLParser: NSObject, XMLParserDelegate {
 }
 
 private func inflate(_ compressedData: Data, expectedSize: Int) -> Data? {
-    guard !compressedData.isEmpty else { return Data() }
+    guard expectedSize >= 0,
+          expectedSize <= maxUncompressedZIPEntrySize,
+          !compressedData.isEmpty else {
+        return expectedSize == 0 && compressedData.isEmpty ? Data() : nil
+    }
 
     var stream = z_stream()
     let initResult = inflateInit2_(&stream, -MAX_WBITS, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size))
