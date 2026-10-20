@@ -2,7 +2,7 @@ import Foundation
 import UniformTypeIdentifiers
 import zlib
 
-private let maxUncompressedZIPEntrySize = 64 * 1024 * 1024
+private nonisolated let maxUncompressedZIPEntrySize = 64 * 1024 * 1024
 
 enum BookImportError: LocalizedError, Equatable {
     case unsupportedFileType
@@ -186,7 +186,7 @@ struct EPUBArchive {
     private let data: Data
     private let entries: [String: Entry]
 
-    init(url: URL, fileManager: FileManager) throws {
+    nonisolated init(url: URL, fileManager: FileManager) throws {
         guard let data = try? Data(contentsOf: url, options: [.mappedIfSafe]) else {
             throw EPUBArchiveError.invalidEPUB
         }
@@ -194,7 +194,7 @@ struct EPUBArchive {
         self.entries = try EPUBArchive.makeEntries(from: data)
     }
 
-    func data(for name: String) throws -> Data {
+    nonisolated func data(for name: String) throws -> Data {
         guard let normalizedName = try? EPUBArchivePath.normalized(name),
               let entry = entries[normalizedName] else {
             throw EPUBArchiveError.invalidEPUB
@@ -228,7 +228,7 @@ struct EPUBArchive {
         }
     }
 
-    private static func makeEntries(from data: Data) throws -> [String: Entry] {
+    private nonisolated static func makeEntries(from data: Data) throws -> [String: Entry] {
         guard let endOfCentralDirectory = data.lastSignature(0x06054b50, maximumDistance: 65_557),
               endOfCentralDirectory + 22 <= data.count else {
             throw EPUBArchiveError.invalidEPUB
@@ -237,16 +237,22 @@ struct EPUBArchive {
         let entryCount = Int(data.uint16(at: endOfCentralDirectory + 10))
         let centralDirectorySize = Int(data.uint32(at: endOfCentralDirectory + 12))
         let centralDirectoryOffset = Int(data.uint32(at: endOfCentralDirectory + 16))
+        let (centralDirectoryEnd, centralDirectoryOverflow) = centralDirectoryOffset.addingReportingOverflow(
+            centralDirectorySize
+        )
         guard centralDirectoryOffset >= 0,
               centralDirectorySize >= 0,
-              centralDirectoryOffset + centralDirectorySize <= data.count else {
+              !centralDirectoryOverflow,
+              centralDirectoryEnd <= data.count else {
             throw EPUBArchiveError.invalidEPUB
         }
 
         var entries = [String: Entry]()
         var offset = centralDirectoryOffset
         for _ in 0..<entryCount {
-            guard offset + 46 <= data.count,
+            guard offset >= centralDirectoryOffset,
+                  offset <= centralDirectoryEnd,
+                  centralDirectoryEnd - offset >= 46,
                   data.uint32(at: offset) == 0x02014b50 else {
                 throw EPUBArchiveError.invalidEPUB
             }
@@ -259,10 +265,21 @@ struct EPUBArchive {
             let commentLength = Int(data.uint16(at: offset + 32))
             let localHeaderOffset = Int(data.uint32(at: offset + 42))
             let nameStart = offset + 46
+            guard nameStart <= centralDirectoryEnd,
+                  nameLength <= centralDirectoryEnd - nameStart else {
+                throw EPUBArchiveError.invalidEPUB
+            }
             let nameEnd = nameStart + nameLength
+            guard extraLength <= centralDirectoryEnd - nameEnd else {
+                throw EPUBArchiveError.invalidEPUB
+            }
+            let extraEnd = nameEnd + extraLength
+            guard commentLength <= centralDirectoryEnd - extraEnd else {
+                throw EPUBArchiveError.invalidEPUB
+            }
+            let entryEnd = extraEnd + commentLength
             guard declaredUncompressedSize <= UInt64(maxUncompressedZIPEntrySize),
                   compressedSize <= maxUncompressedZIPEntrySize,
-                  nameEnd <= data.count,
                   let rawName = String(data: data.subdata(in: nameStart..<nameEnd), encoding: .utf8),
                   let name = try? EPUBArchivePath.normalizedArchiveEntry(rawName) else {
                 throw EPUBArchiveError.invalidEPUB
@@ -274,7 +291,10 @@ struct EPUBArchive {
                 uncompressedSize: Int(declaredUncompressedSize),
                 localHeaderOffset: localHeaderOffset
             )
-            offset = nameEnd + extraLength + commentLength
+            offset = entryEnd
+        }
+        guard offset == centralDirectoryEnd else {
+            throw EPUBArchiveError.invalidEPUB
         }
         return entries
     }
@@ -368,7 +388,7 @@ private final class PackageXMLParser: NSObject, XMLParserDelegate {
     }
 }
 
-private func inflate(_ compressedData: Data, expectedSize: Int) -> Data? {
+private nonisolated func inflate(_ compressedData: Data, expectedSize: Int) -> Data? {
     guard expectedSize >= 0,
           expectedSize <= maxUncompressedZIPEntrySize,
           !compressedData.isEmpty else {
@@ -403,19 +423,19 @@ private func inflate(_ compressedData: Data, expectedSize: Int) -> Data? {
 }
 
 private extension Data {
-    func uint16(at offset: Int) -> UInt16 {
+    nonisolated func uint16(at offset: Int) -> UInt16 {
         UInt16(self[offset]) |
             UInt16(self[offset + 1]) << 8
     }
 
-    func uint32(at offset: Int) -> UInt32 {
+    nonisolated func uint32(at offset: Int) -> UInt32 {
         UInt32(self[offset]) |
             UInt32(self[offset + 1]) << 8 |
             UInt32(self[offset + 2]) << 16 |
             UInt32(self[offset + 3]) << 24
     }
 
-    func lastSignature(_ signature: UInt32, maximumDistance: Int) -> Int? {
+    nonisolated func lastSignature(_ signature: UInt32, maximumDistance: Int) -> Int? {
         let start = Swift.max(0, count - maximumDistance)
         guard count >= 4 else { return nil }
         for offset in stride(from: count - 4, through: start, by: -1) {

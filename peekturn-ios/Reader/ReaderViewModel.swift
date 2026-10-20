@@ -16,6 +16,7 @@ final class ReaderViewModel: ObservableObject {
     private let repository: BookRepository
     private var loadTask: Task<Void, Never>?
     private var readingDocument: EPUBReadingDocument?
+    private(set) var loadID = UUID()
 
     init(book: Book, repository: BookRepository) {
         self.book = book
@@ -25,6 +26,8 @@ final class ReaderViewModel: ObservableObject {
 
     func load() {
         stop()
+        let currentLoadID = UUID()
+        loadID = currentLoadID
         state = .loading
 
         let epubURL: URL?
@@ -46,23 +49,41 @@ final class ReaderViewModel: ObservableObject {
                     try EPUBBookReader().prepareReadingDocument(from: epubURL)
                 }.value
 
-                guard !Task.isCancelled else {
+                guard !Task.isCancelled,
+                      let self,
+                      self.loadID == currentLoadID else {
                     document.removeTemporaryFiles()
                     return
                 }
 
-                self?.readingDocument = document
-                self?.state = .loaded(document)
+                self.readingDocument = document
+                self.state = .loaded(document)
             } catch {
-                guard !Task.isCancelled else { return }
-                self?.state = .failed(Self.userFacingMessage(for: error))
+                guard !Task.isCancelled,
+                      let self,
+                      self.loadID == currentLoadID else {
+                    return
+                }
+                self.state = .failed(Self.userFacingMessage(for: error))
             }
         }
+    }
+
+    func handleWebKitFailure(_ message: String, for loadID: UUID) {
+        guard self.loadID == loadID else { return }
+        guard case .loaded = state else { return }
+
+        loadTask?.cancel()
+        loadTask = nil
+        readingDocument?.removeTemporaryFiles()
+        readingDocument = nil
+        state = .failed(message.isEmpty ? "This book could not be displayed." : message)
     }
 
     func stop() {
         loadTask?.cancel()
         loadTask = nil
+        loadID = UUID()
         readingDocument?.removeTemporaryFiles()
         readingDocument = nil
     }

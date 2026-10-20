@@ -8,7 +8,7 @@ enum EPUBArchivePathError: Error, Equatable {
 }
 
 struct EPUBArchivePath {
-    static func normalized(_ rawPath: String, relativeTo basePath: String? = nil) throws -> String {
+    nonisolated static func normalized(_ rawPath: String, relativeTo basePath: String? = nil) throws -> String {
         let baseComponents: [String]
         if let basePath {
             baseComponents = try components(from: basePath, startingWith: [])
@@ -19,7 +19,7 @@ struct EPUBArchivePath {
         return try components(from: rawPath, startingWith: baseComponents).joined(separator: "/")
     }
 
-    static func normalizedArchiveEntry(_ rawPath: String) throws -> String {
+    nonisolated static func normalizedArchiveEntry(_ rawPath: String) throws -> String {
         let decodedPath = try decodedPath(from: rawPath, strippingURIComponents: false)
         guard !decodedPath.split(separator: "/").contains("..") else {
             throw EPUBArchivePathError.pathTraversal
@@ -27,14 +27,14 @@ struct EPUBArchivePath {
         return try normalized(decodedPath)
     }
 
-    static func directory(of path: String) throws -> String? {
+    nonisolated static func directory(of path: String) throws -> String? {
         let normalizedPath = try normalized(path)
         let components = normalizedPath.split(separator: "/").map(String.init)
         guard components.count > 1 else { return nil }
         return components.dropLast().joined(separator: "/")
     }
 
-    private static func components(from rawPath: String, startingWith initial: [String]) throws -> [String] {
+    private nonisolated static func components(from rawPath: String, startingWith initial: [String]) throws -> [String] {
         let decodedPath = try decodedPath(from: rawPath, strippingURIComponents: true)
         guard !decodedPath.hasPrefix("/") else {
             throw EPUBArchivePathError.absolutePath
@@ -61,7 +61,7 @@ struct EPUBArchivePath {
         return components
     }
 
-    private static func decodedPath(from rawPath: String, strippingURIComponents: Bool) throws -> String {
+    private nonisolated static func decodedPath(from rawPath: String, strippingURIComponents: Bool) throws -> String {
         guard !rawPath.isEmpty,
               !rawPath.contains("\0"),
               !rawPath.contains("\\") else {

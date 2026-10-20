@@ -1,12 +1,13 @@
 import Foundation
+import Darwin
 
 struct EPUBReadingDocument: Sendable {
     let mainDocumentURL: URL
     let readAccessDirectory: URL
     let temporaryDirectory: URL
 
-    func removeTemporaryFiles() {
-        try? FileManager.default.removeItem(at: temporaryDirectory)
+    nonisolated func removeTemporaryFiles() {
+        try? FileManager().removeItem(at: temporaryDirectory)
     }
 }
 
@@ -27,14 +28,12 @@ enum EPUBReaderError: LocalizedError, Equatable {
     }
 }
 
-struct EPUBBookReader {
-    private let fileManager: FileManager
+struct EPUBBookReader: Sendable {
 
-    init(fileManager: FileManager = .default) {
-        self.fileManager = fileManager
-    }
+    nonisolated init() {}
 
-    func prepareReadingDocument(from epubURL: URL) throws -> EPUBReadingDocument {
+    nonisolated func prepareReadingDocument(from epubURL: URL) throws -> EPUBReadingDocument {
+        let fileManager = FileManager()
         guard epubURL.isFileURL,
               fileManager.fileExists(atPath: epubURL.path),
               !isDirectory(epubURL) else {
@@ -43,6 +42,9 @@ struct EPUBBookReader {
 
         do {
             let archive = try EPUBArchive(url: epubURL, fileManager: fileManager)
+            guard try archive.data(for: "mimetype") == Data("application/epub+zip".utf8) else {
+                throw EPUBReaderError.invalidEPUB
+            }
             let containerData = try archive.data(for: "META-INF/container.xml")
             let containerParser = ReaderContainerParser()
             guard containerParser.parse(containerData),
@@ -59,8 +61,10 @@ struct EPUBBookReader {
 
             let packageData = try archive.data(for: normalizedPackagePath)
             let packageParser = ReaderPackageParser()
-            guard packageParser.parse(packageData, relativeTo: normalizedPackagePath),
-                  let firstSpineItem = packageParser.firstReadableSpineItem() else {
+            guard packageParser.parse(packageData, relativeTo: normalizedPackagePath) else {
+                throw EPUBReaderError.invalidEPUB
+            }
+            guard let firstSpineItem = packageParser.firstReadableSpineItem() else {
                 throw EPUBReaderError.noReadableContent
             }
 
@@ -71,10 +75,7 @@ struct EPUBBookReader {
 
             let temporaryDirectory = fileManager.temporaryDirectory
                 .appendingPathComponent("PeekturnReader-\(UUID().uuidString)", isDirectory: true)
-            try fileManager.createDirectory(
-                at: temporaryDirectory,
-                withIntermediateDirectories: true
-            )
+            try createDirectory(at: temporaryDirectory)
 
             do {
                 for item in packageParser.manifest.values {
@@ -88,10 +89,7 @@ struct EPUBBookReader {
                         }
                         continue
                     }
-                    try fileManager.createDirectory(
-                        at: destinationURL.deletingLastPathComponent(),
-                        withIntermediateDirectories: true
-                    )
+                    try createDirectory(at: destinationURL.deletingLastPathComponent())
                     try data.write(to: destinationURL, options: .atomic)
                 }
 
@@ -107,7 +105,10 @@ struct EPUBBookReader {
                     .deletingLastPathComponent()
                     .appendingPathComponent(".peekturn-main-\(UUID().uuidString).xhtml")
                 let mainDocumentData = try Data(contentsOf: mainDocumentURL)
-                try ReaderHTMLSecurity.securedData(from: mainDocumentData)
+                guard case .success(let securityPolicy) = ReaderSecurityPolicy.make() else {
+                    throw EPUBReaderError.invalidEPUB
+                }
+                try ReaderHTMLSecurity.securedData(from: mainDocumentData, policy: securityPolicy)
                     .write(to: securedDocumentURL, options: .atomic)
 
                 return EPUBReadingDocument(
@@ -124,7 +125,7 @@ struct EPUBBookReader {
         }
     }
 
-    private func destinationURL(for archivePath: String, in directory: URL) throws -> URL {
+    private nonisolated func destinationURL(for archivePath: String, in directory: URL) throws -> URL {
         guard !archivePath.isEmpty,
               !archivePath.hasPrefix("/"),
               !archivePath.contains("\\") else {
@@ -140,15 +141,28 @@ struct EPUBBookReader {
         return destinationURL
     }
 
-    private func isDirectory(_ url: URL) -> Bool {
+    private nonisolated func isDirectory(_ url: URL) -> Bool {
         var isDirectory: ObjCBool = false
-        guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
+        guard FileManager().fileExists(atPath: url.path, isDirectory: &isDirectory) else {
             return false
         }
         return isDirectory.boolValue
     }
 
-    private func normalizedError(for error: Error) -> EPUBReaderError {
+    private nonisolated func createDirectory(at url: URL) throws {
+        let components = url.standardizedFileURL.pathComponents
+        var currentURL = URL(fileURLWithPath: "/", isDirectory: true)
+        for component in components.dropFirst() {
+            currentURL.appendPathComponent(component, isDirectory: true)
+            let result = currentURL.path.withCString { Darwin.mkdir($0, 0o700) }
+            guard result == 0 || errno == EEXIST else {
+                let code = POSIXErrorCode(rawValue: errno) ?? .EIO
+                throw POSIXError(code)
+            }
+        }
+    }
+
+    private nonisolated func normalizedError(for error: Error) -> EPUBReaderError {
         if let readerError = error as? EPUBReaderError {
             return readerError
         }
@@ -160,7 +174,7 @@ private struct ReaderManifestItem {
     let archivePath: String
     let mediaType: String
 
-    var isReadableDocument: Bool {
+    nonisolated var isReadableDocument: Bool {
         let normalizedMediaType = mediaType
             .split(separator: ";", maxSplits: 1, omittingEmptySubsequences: true)
             .first
@@ -169,7 +183,7 @@ private struct ReaderManifestItem {
     }
 }
 
-private final class ReaderContainerParser: NSObject, XMLParserDelegate {
+private nonisolated final class ReaderContainerParser: NSObject, XMLParserDelegate {
     private(set) var packagePath: String?
 
     func parse(_ data: Data) -> Bool {
@@ -192,7 +206,7 @@ private final class ReaderContainerParser: NSObject, XMLParserDelegate {
     }
 }
 
-private final class ReaderPackageParser: NSObject, XMLParserDelegate {
+private nonisolated final class ReaderPackageParser: NSObject, XMLParserDelegate {
     private(set) var manifest = [String: ReaderManifestItem]()
     private var spineItemReferences = [(id: String?, isLinear: Bool)]()
     private var packageDirectory: String?

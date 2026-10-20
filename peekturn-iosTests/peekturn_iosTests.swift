@@ -91,6 +91,24 @@ struct peekturn_iosTests {
         #expect(remainingFiles.isEmpty)
     }
 
+    @Test func importerRejectsCentralDirectoryNameOutsideDeclaredRange() throws {
+        try assertImporterRejects(
+            replacingFirstCentralDirectoryField(in: makeEPUBData(title: "Book", author: "Author"), fieldOffset: 28, with: .max)
+        )
+    }
+
+    @Test func importerRejectsCentralDirectoryExtraFieldOutsideDeclaredRange() throws {
+        try assertImporterRejects(
+            replacingFirstCentralDirectoryField(in: makeEPUBData(title: "Book", author: "Author"), fieldOffset: 30, with: .max)
+        )
+    }
+
+    @Test func importerRejectsCentralDirectoryCommentOutsideDeclaredRange() throws {
+        try assertImporterRejects(
+            replacingFirstCentralDirectoryField(in: makeEPUBData(title: "Book", author: "Author"), fieldOffset: 32, with: .max)
+        )
+    }
+
     @Test func readerPreparesFirstSpineDocumentFromEPUB() throws {
         let fileManager = FileManager.default
         let rootDirectory = try makeTemporaryDirectory()
@@ -109,12 +127,66 @@ struct peekturn_iosTests {
         #expect(chapter.contains("Original EPUB content."))
     }
 
+    @Test func readerPreparesLargerEPUBFromDetachedWork() async throws {
+        let rootDirectory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: rootDirectory) }
+
+        let epubURL = rootDirectory.appendingPathComponent("larger-reader.epub")
+        let largeChapter = String(repeating: "<p>Reading content.</p>", count: 40_000)
+        try makeReaderEPUBData(
+            packageXML: """
+            <package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+                <manifest><item id="chapter" href="Text/chapter.xhtml" media-type="application/xhtml+xml"/></manifest>
+                <spine><itemref idref="chapter"/></spine>
+            </package>
+            """,
+            resources: [("OEBPS/Text/chapter.xhtml", "<html><head></head><body>\(largeChapter)</body></html>")]
+        ).write(to: epubURL)
+
+        let document = try await Task.detached(priority: .userInitiated) {
+            try EPUBBookReader().prepareReadingDocument(from: epubURL)
+        }.value
+        defer { document.removeTemporaryFiles() }
+
+        #expect(FileManager.default.fileExists(atPath: document.mainDocumentURL.path))
+    }
+
     @Test func readerReportsInvalidEPUBSource() throws {
         let rootDirectory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: rootDirectory) }
 
         let epubURL = rootDirectory.appendingPathComponent("broken.epub")
         try Data("not an EPUB".utf8).write(to: epubURL)
+
+        do {
+            _ = try EPUBBookReader().prepareReadingDocument(from: epubURL)
+            #expect(Bool(false))
+        } catch {
+            #expect(error as? EPUBReaderError == .invalidEPUB)
+        }
+    }
+
+    @Test func readerRejectsZIPWithInvalidMimetype() throws {
+        let epubURL = try writeReaderEPUB(
+            packageXML: "<package><manifest/><spine/></package>",
+            mimetype: "application/zip"
+        )
+        defer { try? FileManager.default.removeItem(at: epubURL.deletingLastPathComponent()) }
+
+        do {
+            _ = try EPUBBookReader().prepareReadingDocument(from: epubURL)
+            #expect(Bool(false))
+        } catch {
+            #expect(error as? EPUBReaderError == .invalidEPUB)
+        }
+    }
+
+    @Test func readerClassifiesMalformedOPFAsInvalidEPUB() throws {
+        let epubURL = try writeReaderEPUB(
+            packageXML: "<package><manifest>",
+            mimetype: "application/epub+zip"
+        )
+        defer { try? FileManager.default.removeItem(at: epubURL.deletingLastPathComponent()) }
 
         do {
             _ = try EPUBBookReader().prepareReadingDocument(from: epubURL)
@@ -342,14 +414,36 @@ struct peekturn_iosTests {
         #expect(!ReaderNavigationPolicy.allowsNavigation(outsideURL, inside: rootDirectory))
     }
 
-    @Test func readerHTMLSecurityDisablesExternalNetworkCapabilities() {
-        let securedHTML = ReaderHTMLSecurity.securedData(from: Data("<html><head></head><body>Book</body></html>".utf8))
+    @Test func readerSecurityPolicyInitializesSuccessfully() throws {
+        guard case .success(let policy) = ReaderSecurityPolicy.make() else {
+            #expect(Bool(false))
+            return
+        }
+
+        #expect(policy.contentSecurityPolicy.contains("script-src 'none'"))
+        #expect(policy.encodedContentRuleList.contains("\"type\":\"block\""))
+    }
+
+    @Test func readerSecurityPolicyFailsClosedWhenRulesAreInvalid() {
+        guard case .failure(.invalidContentRuleList) = ReaderSecurityPolicy.make(encodedContentRuleList: "not-json") else {
+            #expect(Bool(false))
+            return
+        }
+    }
+
+    @Test func readerHTMLSecurityDisablesExternalNetworkCapabilities() throws {
+        let policy = try #require(try? ReaderSecurityPolicy.make().get())
+        let securedHTML = try ReaderHTMLSecurity.securedData(
+            from: Data("<html><head><script>window.bad = true</script></head><body>Book</body></html>".utf8),
+            policy: policy
+        )
         let html = String(data: securedHTML, encoding: .utf8) ?? ""
 
         #expect(html.contains("connect-src 'none'"))
         #expect(html.contains("script-src 'none'"))
         #expect(!html.contains("http://"))
         #expect(!html.contains("https://"))
+        #expect(html.range(of: "Content-Security-Policy")!.lowerBound < html.range(of: "<script")!.lowerBound)
     }
 
     @Test func readerNavigationReturnsToLibrary() {
@@ -434,6 +528,43 @@ struct peekturn_iosTests {
             #expect(fileManager.fileExists(atPath: document.mainDocumentURL.path))
         } else {
             #expect(Bool(false))
+        }
+        viewModel.stop()
+    }
+
+    @Test @MainActor func readerViewModelWebKitFailureEntersFailedStateAndRetryRecovers() async throws {
+        let fileManager = FileManager.default
+        let rootDirectory = try makeTemporaryDirectory()
+        defer { try? fileManager.removeItem(at: rootDirectory) }
+        let repository = BookRepository(rootDirectory: rootDirectory)
+        let book = Book(title: "Book", author: "Author", epubFileName: "book.epub")
+        let bookURL = try #require(try repository.fileURL(for: book))
+        try fileManager.createDirectory(at: repository.booksDirectory, withIntermediateDirectories: true)
+        try makeReadableEPUBData().write(to: bookURL)
+        try repository.save(book)
+
+        let viewModel = ReaderViewModel(book: book, repository: repository)
+        try await waitForReaderState(viewModel) { state in
+            if case .loaded = state { return true }
+            return false
+        }
+
+        let failedLoadID = viewModel.loadID
+        viewModel.handleWebKitFailure("WebKit failed to load the chapter.", for: failedLoadID)
+        if case .failed(let message) = viewModel.state {
+            #expect(message == "WebKit failed to load the chapter.")
+        } else {
+            #expect(Bool(false))
+        }
+
+        viewModel.load()
+        guard case .loading = viewModel.state else {
+            #expect(Bool(false))
+            return
+        }
+        try await waitForReaderState(viewModel) { state in
+            if case .loaded = state { return true }
+            return false
         }
         viewModel.stop()
     }
@@ -755,14 +886,16 @@ private func makeReadableEPUBData() -> Data {
 private func writeReaderEPUB(
     packagePath: String = "OEBPS/content.opf",
     packageXML: String,
-    resources: [(String, String)] = []
+    resources: [(String, String)] = [],
+    mimetype: String = "application/epub+zip"
 ) throws -> URL {
     let rootDirectory = try makeTemporaryDirectory()
     let epubURL = rootDirectory.appendingPathComponent("reader.epub")
     try makeReaderEPUBData(
         packagePath: packagePath,
         packageXML: packageXML,
-        resources: resources
+        resources: resources,
+        mimetype: mimetype
     ).write(to: epubURL)
     return epubURL
 }
@@ -770,7 +903,8 @@ private func writeReaderEPUB(
 private func makeReaderEPUBData(
     packagePath: String = "OEBPS/content.opf",
     packageXML: String,
-    resources: [(String, String)] = []
+    resources: [(String, String)] = [],
+    mimetype: String = "application/epub+zip"
 ) -> Data {
     let containerXML = """
     <?xml version="1.0" encoding="UTF-8"?>
@@ -783,7 +917,7 @@ private func makeReaderEPUBData(
 
     let packageEntryPath = packagePath.removingPercentEncoding ?? packagePath
     var entries: [(String, Data)] = [
-        ("mimetype", Data("application/epub+zip".utf8)),
+        ("mimetype", Data(mimetype.utf8)),
         ("META-INF/container.xml", containerXML),
         (packageEntryPath, Data(packageXML.utf8))
     ]
@@ -822,6 +956,41 @@ private func replacingFirstCentralDirectoryUncompressedSize(in data: Data, with 
         break
     }
     return result
+}
+
+private func replacingFirstCentralDirectoryField(in data: Data, fieldOffset: Int, with value: UInt16) -> Data {
+    var result = data
+    for offset in 0..<(result.count - 46) {
+        guard result[offset] == 0x50,
+              result[offset + 1] == 0x4b,
+              result[offset + 2] == 0x01,
+              result[offset + 3] == 0x02 else {
+            continue
+        }
+
+        result[offset + fieldOffset] = UInt8(value & 0xff)
+        result[offset + fieldOffset + 1] = UInt8((value >> 8) & 0xff)
+        break
+    }
+    return result
+}
+
+private func assertImporterRejects(_ data: Data) throws {
+    let fileManager = FileManager.default
+    let rootDirectory = try makeTemporaryDirectory()
+    defer { try? fileManager.removeItem(at: rootDirectory) }
+
+    let sourceURL = rootDirectory.appendingPathComponent("invalid-central-directory.epub")
+    try data.write(to: sourceURL)
+    let storageDirectory = rootDirectory.appendingPathComponent("PrivateBooks", isDirectory: true)
+    let importer = BookImporter(storageDirectory: storageDirectory)
+
+    do {
+        _ = try importer.importBook(from: sourceURL)
+        #expect(Bool(false))
+    } catch {
+        #expect(error as? BookImportError == .invalidEPUB)
+    }
 }
 
 private func makeStoredZIP(entries: [(String, Data)]) -> Data {

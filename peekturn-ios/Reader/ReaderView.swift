@@ -23,9 +23,13 @@ struct ReaderView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .accessibilityIdentifier("reader-loading-state")
             case .loaded(let document):
+                let loadID = viewModel.loadID
                 EPUBWebView(
                     documentURL: document.mainDocumentURL,
-                    readAccessDirectory: document.readAccessDirectory
+                    readAccessDirectory: document.readAccessDirectory,
+                    onFailure: { message in
+                        viewModel.handleWebKitFailure(message, for: loadID)
+                    }
                 )
                 .accessibilityIdentifier("epub-reader-webview")
             case .failed(let message):
@@ -75,6 +79,7 @@ struct ReaderView: View {
 private struct EPUBWebView: UIViewRepresentable {
     let documentURL: URL
     let readAccessDirectory: URL
+    let onFailure: (String) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -83,6 +88,7 @@ private struct EPUBWebView: UIViewRepresentable {
     func makeUIView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
         configuration.userContentController = WKUserContentController()
+        configuration.defaultWebpagePreferences.allowsContentJavaScript = false
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.isOpaque = false
         webView.backgroundColor = .clear
@@ -91,7 +97,8 @@ private struct EPUBWebView: UIViewRepresentable {
         context.coordinator.prepareToLoad(
             webView: webView,
             documentURL: documentURL,
-            readAccessDirectory: readAccessDirectory
+            readAccessDirectory: readAccessDirectory,
+            onFailure: onFailure
         )
         return webView
     }
@@ -100,31 +107,45 @@ private struct EPUBWebView: UIViewRepresentable {
         context.coordinator.prepareToLoad(
             webView: webView,
             documentURL: documentURL,
-            readAccessDirectory: readAccessDirectory
+            readAccessDirectory: readAccessDirectory,
+            onFailure: onFailure
         )
     }
 
     final class Coordinator: NSObject, WKNavigationDelegate {
         private var hasStartedLoading = false
         private var readAccessDirectory: URL?
+        private var onFailure: ((String) -> Void)?
 
-        func prepareToLoad(webView: WKWebView, documentURL: URL, readAccessDirectory: URL) {
+        func prepareToLoad(
+            webView: WKWebView,
+            documentURL: URL,
+            readAccessDirectory: URL,
+            onFailure: @escaping (String) -> Void
+        ) {
+            self.onFailure = onFailure
             guard !hasStartedLoading else { return }
             hasStartedLoading = true
             self.readAccessDirectory = readAccessDirectory
 
-            let encodedRules = """
-            [{"trigger":{"url-filter":"^https?://","resource-type":["document","image","style-sheet","script","font","media","svg-document","raw","popup"]},"action":{"type":"block"}}]
-            """
+            guard case .success(let securityPolicy) = ReaderSecurityPolicy.make() else {
+                reportFailure("Reader security could not be initialized.")
+                return
+            }
+
             WKContentRuleListStore.default().compileContentRuleList(
                 forIdentifier: "PeekturnReaderBlockExternalNetwork",
-                encodedContentRuleList: encodedRules
-            ) { [weak self, weak webView] ruleList, _ in
+                encodedContentRuleList: securityPolicy.encodedContentRuleList
+            ) { [weak self, weak webView] ruleList, error in
                 DispatchQueue.main.async {
                     guard let self, let webView else { return }
-                    if let ruleList {
-                        webView.configuration.userContentController.add(ruleList)
+                    guard let ruleList else {
+                        self.reportFailure(
+                            error?.localizedDescription ?? "Reader security could not be initialized."
+                        )
+                        return
                     }
+                    webView.configuration.userContentController.add(ruleList)
                     webView.loadFileURL(
                         documentURL,
                         allowingReadAccessTo: readAccessDirectory
@@ -171,9 +192,30 @@ private struct EPUBWebView: UIViewRepresentable {
 
         func webView(
             _ webView: WKWebView,
+            didFail navigation: WKNavigation!,
+            withError error: Error
+        ) {
+            reportFailure(error.localizedDescription)
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            didFailProvisionalNavigation navigation: WKNavigation!,
+            withError error: Error
+        ) {
+            reportFailure(error.localizedDescription)
+        }
+
+        func webView(
+            _ webView: WKWebView,
             didReceiveServerRedirectForProvisionalNavigation navigation: WKNavigation!
         ) {
             webView.stopLoading()
+            reportFailure("External redirects are not allowed.")
+        }
+
+        private func reportFailure(_ message: String) {
+            onFailure?(message)
         }
     }
 }
