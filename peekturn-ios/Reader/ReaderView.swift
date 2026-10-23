@@ -116,8 +116,11 @@ private struct EPUBWebView: UIViewRepresentable {
 
 final class ReaderWebViewCoordinator: NSObject, WKNavigationDelegate {
     private let securityPolicyProvider: () -> Result<ReaderSecurityPolicy, ReaderSecurityPolicyError>
+    private let navigationPolicy: (URL, URL) -> Bool
     private let onFinish: () -> Void
+    private let onServerRedirect: () -> Void
     private var hasStartedLoading = false
+    private var hasRejectedServerRedirect = false
     private var readAccessDirectory: URL?
     private var onFailure: ((String) -> Void)?
 
@@ -125,10 +128,16 @@ final class ReaderWebViewCoordinator: NSObject, WKNavigationDelegate {
         securityPolicyProvider: @escaping () -> Result<ReaderSecurityPolicy, ReaderSecurityPolicyError> = {
             ReaderSecurityPolicy.make()
         },
-        onFinish: @escaping () -> Void = {}
+        navigationPolicy: @escaping (URL, URL) -> Bool = { url, readAccessDirectory in
+            ReaderNavigationPolicy.allowsNavigation(url, inside: readAccessDirectory)
+        },
+        onFinish: @escaping () -> Void = {},
+        onServerRedirect: @escaping () -> Void = {}
     ) {
         self.securityPolicyProvider = securityPolicyProvider
+        self.navigationPolicy = navigationPolicy
         self.onFinish = onFinish
+        self.onServerRedirect = onServerRedirect
         super.init()
     }
 
@@ -141,6 +150,7 @@ final class ReaderWebViewCoordinator: NSObject, WKNavigationDelegate {
         self.onFailure = onFailure
         guard !hasStartedLoading else { return }
         hasStartedLoading = true
+        hasRejectedServerRedirect = false
         self.readAccessDirectory = readAccessDirectory
 
         guard case .success(let securityPolicy) = securityPolicyProvider() else {
@@ -181,7 +191,7 @@ final class ReaderWebViewCoordinator: NSObject, WKNavigationDelegate {
         }
 
         decisionHandler(
-            ReaderNavigationPolicy.allowsNavigation(url, inside: readAccessDirectory)
+            navigationPolicy(url, readAccessDirectory)
                 ? .allow
                 : .cancel
         )
@@ -199,7 +209,7 @@ final class ReaderWebViewCoordinator: NSObject, WKNavigationDelegate {
         }
 
         decisionHandler(
-            ReaderNavigationPolicy.allowsResourceRequest(url, inside: readAccessDirectory)
+            navigationPolicy(url, readAccessDirectory)
                 ? .allow
                 : .cancel
         )
@@ -210,6 +220,7 @@ final class ReaderWebViewCoordinator: NSObject, WKNavigationDelegate {
         didFail navigation: WKNavigation!,
         withError error: Error
     ) {
+        guard !hasRejectedServerRedirect else { return }
         reportFailure(error.localizedDescription)
     }
 
@@ -222,6 +233,7 @@ final class ReaderWebViewCoordinator: NSObject, WKNavigationDelegate {
         didFailProvisionalNavigation navigation: WKNavigation!,
         withError error: Error
     ) {
+        guard !hasRejectedServerRedirect else { return }
         reportFailure(error.localizedDescription)
     }
 
@@ -229,6 +241,8 @@ final class ReaderWebViewCoordinator: NSObject, WKNavigationDelegate {
         _ webView: WKWebView,
         didReceiveServerRedirectForProvisionalNavigation navigation: WKNavigation!
     ) {
+        hasRejectedServerRedirect = true
+        onServerRedirect()
         webView.stopLoading()
         reportFailure("External redirects are not allowed.")
     }

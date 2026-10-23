@@ -1,4 +1,5 @@
 import Foundation
+import Network
 import Testing
 import UIKit
 import WebKit
@@ -828,6 +829,51 @@ struct peekturn_iosTests {
         viewModel.stop()
     }
 
+    @Test @MainActor func readerViewModelIgnoresCallbacksFromOlderLoadID() async throws {
+        let fileManager = FileManager.default
+        let rootDirectory = try makeTemporaryDirectory()
+        defer { try? fileManager.removeItem(at: rootDirectory) }
+        let repository = BookRepository(rootDirectory: rootDirectory)
+        let book = Book(title: "Book", author: "Author", epubFileName: "book.epub")
+        let bookURL = try #require(try repository.fileURL(for: book))
+        try fileManager.createDirectory(at: repository.booksDirectory, withIntermediateDirectories: true)
+        try makeReadableEPUBData().write(to: bookURL)
+        try repository.save(book)
+
+        let viewModel = ReaderViewModel(book: book, repository: repository)
+        let firstLoadID = viewModel.loadID
+        guard case .loading = viewModel.state else {
+            #expect(Bool(false))
+            return
+        }
+
+        viewModel.load()
+        let secondLoadID = viewModel.loadID
+        #expect(firstLoadID != secondLoadID)
+        guard case .loading = viewModel.state else {
+            #expect(Bool(false))
+            return
+        }
+
+        viewModel.handleWebKitFailure("The old load failed.", for: firstLoadID)
+        viewModel.handleWebKitFailure("The old load redirected.", for: firstLoadID)
+        guard case .loading = viewModel.state else {
+            #expect(Bool(false))
+            return
+        }
+
+        try await waitForReaderState(viewModel) { state in
+            if case .loaded = state { return true }
+            return false
+        }
+        #expect(viewModel.loadID == secondLoadID)
+        guard case .loaded = viewModel.state else {
+            #expect(Bool(false))
+            return
+        }
+        viewModel.stop()
+    }
+
     @Test func repositoryPersistsAndDeletesBookAndFile() throws {
         let fileManager = FileManager.default
         let rootDirectory = try makeTemporaryDirectory()
@@ -1015,11 +1061,10 @@ struct readerWebKitIntegrationTests {
         try Data("body { color: rgb(10, 20, 30); }".utf8)
             .write(to: rootDirectory.appendingPathComponent("reader.css"))
         try #require(onePixelPNGData()).write(to: rootDirectory.appendingPathComponent("pixel.png"))
-        let fontSource = try #require([
-            "/System/Library/Fonts/SFNS.ttf",
-            "/System/Library/Fonts/Helvetica.ttc",
-            "/System/Library/Fonts/CoreUI/SFUI.ttf"
-        ].map(URL.init(fileURLWithPath:)).first { fileManager.fileExists(atPath: $0.path) })
+        let fontSource = try #require(
+            Bundle(for: ReaderWebKitTestBundleMarker.self)
+                .url(forResource: "ReaderTestFont", withExtension: "ttf")
+        )
         try Data(contentsOf: fontSource)
             .write(to: rootDirectory.appendingPathComponent("reader-font.ttf"))
 
@@ -1113,6 +1158,63 @@ struct readerWebKitIntegrationTests {
         #expect(redirectWebView.url?.isFileURL == true)
     }
 
+    @Test @MainActor func readerWKWebViewRejectsExternalHTTPServerRedirect() async throws {
+        let rootDirectory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: rootDirectory) }
+        let chapterURL = rootDirectory.appendingPathComponent("chapter.xhtml")
+        try Data("<html><body>Local</body></html>".utf8).write(to: chapterURL)
+
+        let server = try LocalHTTPRedirectServer()
+        defer { server.stop() }
+
+        let initialWaiter = ReaderWebKitLoadWaiter()
+        let redirectWaiter = ReaderWebKitFailureWaiter()
+        var didReceiveServerRedirect = false
+        let coordinator = ReaderWebViewCoordinator(
+            securityPolicyProvider: {
+                .success(
+                    ReaderSecurityPolicy(
+                        contentSecurityPolicy: "default-src 'self'",
+                        encodedContentRuleList: "[{\"trigger\":{\"url-filter\":\"^https?://nonexistent.invalid/\"},\"action\":{\"type\":\"block\"}}]"
+                    )
+                )
+            },
+            navigationPolicy: { url, readAccessDirectory in
+                if url.scheme == "http",
+                   url.host == "127.0.0.1",
+                   url.port == Int(server.port) {
+                    return true
+                }
+                return ReaderNavigationPolicy.allowsNavigation(url, inside: readAccessDirectory)
+            },
+            onFinish: { initialWaiter.succeed() },
+            onServerRedirect: { didReceiveServerRedirect = true }
+        )
+        let webView = makeReaderWebView(coordinator: coordinator)
+        try await initialWaiter.wait(
+            coordinator: coordinator,
+            webView: webView,
+            documentURL: chapterURL,
+            readAccessDirectory: rootDirectory
+        )
+
+        coordinator.prepareToLoad(
+            webView: webView,
+            documentURL: chapterURL,
+            readAccessDirectory: rootDirectory,
+            onFailure: { message in
+                redirectWaiter.fail(message)
+            }
+        )
+        webView.load(URLRequest(url: server.redirectURL))
+
+        let failureMessage = await redirectWaiter.wait()
+        #expect(server.didReceiveRequest)
+        #expect(didReceiveServerRedirect)
+        #expect(failureMessage == "External redirects are not allowed.")
+        #expect(webView.url?.isFileURL == true || webView.url == nil)
+    }
+
     @Test @MainActor func readerWKWebViewFailsClosedWhenContentRuleListCompilationFails() async throws {
         let rootDirectory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: rootDirectory) }
@@ -1185,6 +1287,90 @@ private enum ReaderWebKitTestError: Error {
     case failed(String)
 }
 
+private enum LocalHTTPServerError: Error {
+    case failedToStart
+}
+
+private final class LocalHTTPRedirectServer: @unchecked Sendable {
+    private let listener: NWListener
+    private let queue = DispatchQueue(label: "peekturn.reader-tests.http-server")
+    private let readySemaphore = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var storedPort: UInt16 = 0
+    private var receivedRequest = false
+
+    init() throws {
+        listener = try NWListener(using: .tcp, on: .any)
+        listener.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .ready:
+                if let port = self.listener.port?.rawValue {
+                    self.lock.lock()
+                    self.storedPort = port
+                    self.lock.unlock()
+                }
+                self.readySemaphore.signal()
+            case .failed, .cancelled:
+                self.readySemaphore.signal()
+            default:
+                break
+            }
+        }
+        listener.newConnectionHandler = { [weak self] connection in
+            self?.handle(connection)
+        }
+        listener.start(queue: queue)
+
+        guard readySemaphore.wait(timeout: .now() + 5) == .success,
+              port != 0 else {
+            listener.cancel()
+            throw LocalHTTPServerError.failedToStart
+        }
+    }
+
+    var port: UInt16 {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedPort
+    }
+
+    var redirectURL: URL {
+        URL(string: "http://127.0.0.1:\(port)/redirect")!
+    }
+
+    private var externalURL: URL {
+        URL(string: "http://127.0.0.1:\(port)/external")!
+    }
+
+    var didReceiveRequest: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return receivedRequest
+    }
+
+    func stop() {
+        listener.cancel()
+    }
+
+    private func handle(_ connection: NWConnection) {
+        connection.start(queue: queue)
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 8_192) { [weak self, weak connection] _, _, _, _ in
+            guard let self, let connection else { return }
+            self.lock.lock()
+            self.receivedRequest = true
+            self.lock.unlock()
+
+            let response = Data(
+                "HTTP/1.1 302 Found\r\nLocation: \(externalURL.absoluteString)\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8
+            )
+            connection.send(content: response, completion: .contentProcessed { _ in
+                connection.cancel()
+            })
+        }
+    }
+}
+
 @MainActor
 private final class ReaderWebKitLoadWaiter {
     private var continuation: CheckedContinuation<Void, Error>?
@@ -1224,6 +1410,33 @@ private final class ReaderWebKitLoadWaiter {
         continuation = nil
     }
 }
+
+@MainActor
+private final class ReaderWebKitFailureWaiter {
+    private var continuation: CheckedContinuation<String, Never>?
+    private var message: String?
+
+    func wait() async -> String {
+        if let message {
+            return message
+        }
+        return await withCheckedContinuation { continuation in
+            self.continuation = continuation
+        }
+    }
+
+    func fail(_ message: String) {
+        guard self.message == nil else { return }
+        if let continuation {
+            self.continuation = nil
+            continuation.resume(returning: message)
+        } else {
+            self.message = message
+        }
+    }
+}
+
+private final class ReaderWebKitTestBundleMarker {}
 
 @MainActor
 private func makeReaderWebView(coordinator: ReaderWebViewCoordinator) -> WKWebView {
